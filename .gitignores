@@ -1,0 +1,8 @@
+# dataset besar
+Dataset/UCI-IHEPC/household_power_consumption.txt
+
+# optional
+*.csv
+*.joblib
+__pycache__/
+.ipynb_checkpoints/
