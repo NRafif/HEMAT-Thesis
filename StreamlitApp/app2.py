@@ -3,16 +3,26 @@
 ========================================================
 
 Enhanced version with:
-- Dataset selection (France vs Indonesia)
-- Model selection (FR and ID)
-- Preset scenarios
+- Model ID (PELITA/Indonesia) — satu-satunya dataset aktif di dashboard ini.
+  [FIX #9] Sebelumnya tertulis "Dataset selection (France vs Indonesia)" dan
+  "Model selection (FR and ID)" sebagai fitur -- ini sudah tidak akurat sejak
+  `is_indonesia = True` di-hardcode di main() dan tidak ada toggle apa pun
+  di UI untuk memilih dataset Prancis. Beberapa fungsi (prepare_model_input_
+  for_hour, predict_daily_curve, generate_pdf_report) masih membawa parameter
+  is_indonesia sebagai sisa infrastruktur dari versi lama yang pernah
+  mendukung 2 dataset -- dipertahankan agar tidak perlu ubah banyak
+  signature, tapi jalur France sudah tidak dapat diakses dari UI.
+- Preset scenarios (Profil Kepemilikan Rumah)
 - Clear analysis logic
-- PDF export
+- PDF export (termasuk konteks simulasi Weekday/Weekend)
 - Analysis button to trigger breakdown
+- Recommendation database (RECOMMENDATION_DB + COMBINATION_RULES) untuk
+  rekomendasi yang lebih personal per alat & kombinasi alat
 
 Author: Nofal Rafif
 """
 
+import logging
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -28,6 +38,12 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+
+# [FIX #10] Logger modul -- dipakai predict_daily_curve() supaya kegagalan
+# prediksi per-jam tidak lagi ditelan diam-diam tanpa jejak (lihat except
+# block di dalam predict_daily_curve untuk detail).
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger("hemat")
 
 # Page config
 st.set_page_config(
@@ -189,6 +205,14 @@ APPLIANCES_INDONESIA = {
     'lamp_180': ('💡 Lampu Rumah Modern', 180, 12),
     'wifi_router': ('📡 Router WiFi', 10, 24)
 }
+
+# [FIX Celah Kritis #1] lamp_80/120/180 merepresentasikan TIGA ASUMSI SKALA
+# PENCAHAYAAN untuk sistem lampu yang SAMA di satu rumah (Sederhana/Menengah/
+# Modern) -- bukan tiga inventaris lampu terpisah yang boleh menyala bareng.
+# Konstanta ini dipakai di sidebar untuk saling mengunci (mutual exclusion)
+# ketiga checkbox tersebut: begitu satu dicentang, dua lainnya di-disable
+# (abu-abu, tidak bisa diklik) sampai yang aktif di-uncheck lagi.
+LAMP_TIER_KEYS = ['lamp_80', 'lamp_120', 'lamp_180']
 
 # Profil kepemilikan — merepresentasikan INVENTARIS rumah, bukan waktu pemakaian.
 # Digunakan untuk mempercepat pengisian form tanpa harus mencentang satu-satu.
@@ -421,7 +445,13 @@ COMBINATION_RULES = [
         'priority': 'HIGH', 'icon': '⚡',
         'action': 'Hindari menyalakan AC dan Setrika bersamaan',
         'reason': (
-            'Keduanya beban tinggi; penggunaan simultan meningkatkan '
+            # [FIX #6] Sebelumnya tertulis "Keduanya beban tinggi" -- AC
+            # (400W) dan Setrika (300W) masuk kategori "sedang" (200-500W)
+            # menurut calculate_realistic_peak sendiri, bukan "tinggi"
+            # (>=500W). Disamakan dengan istilah yang dipakai rule ac+
+            # water_heater di bawah agar konsisten dengan kategorisasi
+            # Simultaneity Factor yang dijelaskan di expander UI.
+            'Keduanya beban sedang-tinggi; penggunaan simultan meningkatkan '
             'risiko MCB trip. Matikan AC sebelum menyetrika.'
         ),
         'category': 'overload_prevention',
@@ -457,6 +487,44 @@ COMBINATION_RULES = [
         'category': 'load_reduction',
     },
 ]
+
+# [FIX #4] Satu-satunya sumber label kategori rekomendasi, dipakai bersama
+# oleh _build_appliance_recommendations() dan _build_combination_recommendations()
+# DAN oleh semua rekomendasi "legacy" hardcoded di generate_recommendations().
+# Sebelumnya ada 2 dict category_labels lokal yang tidak identik (satu di
+# antaranya bahkan tidak punya entri 'cost_saving'), dan rekomendasi legacy
+# tidak diberi 'category'/'triggers' sama sekali -- membuat kartu HIGH-priority
+# (yang justru paling sering dilihat duluan) tampil tanpa badge & pill,
+# sementara kartu sekunder tampil lengkap dengan dekorasi baru.
+CATEGORY_LABELS = {
+    'cost_saving': '\U0001f7e2 Penghematan Biaya',
+    'load_reduction': '\U0001f7e0 Pengurangan Beban',
+    'overload_prevention': '\U0001f534 Pencegahan Overload',
+}
+
+# [FIX #7] Ambang batas "daya besar" dipakai di 3 tempat berbeda dengan nilai
+# berbeda. Ini BUKAN kebetulan/kelalaian -- didokumentasikan di sini sebagai
+# keputusan desain yang disengaja, dengan tujuan masing-masing:
+#
+#   POWER_THRESHOLD_HIGH (500W)   -> dipakai calculate_realistic_peak() untuk
+#                                     kategorisasi Simultaneity Factor IEC 60364
+#                                     (>=500W = "tinggi", faktor puncak penuh).
+#   POWER_THRESHOLD_MEDIUM (200W) -> ambang bawah kategori "sedang" (200-500W)
+#                                     pada fungsi yang sama.
+#   CONFLICT_DETECTION_THRESHOLD (250W) -> ambang KHUSUS untuk deteksi benturan
+#                                     beban generik (Conflict Detection). Sengaja
+#                                     LEBIH RENDAH dari 500W supaya sistem tetap
+#                                     memperingatkan kombinasi alat "sedang" yang
+#                                     jumlahnya signifikan (mis. AC 400W + alat
+#                                     sedang lain), bukan cuma alat kategori
+#                                     "tinggi" murni -- ini pilihan konservatif
+#                                     untuk keselamatan, bukan inkonsistensi.
+#
+# COMBINATION_RULES sengaja TIDAK punya ambang W sama sekali karena aturannya
+# berbasis pasangan alat spesifik (curated), bukan kategorisasi otomatis.
+POWER_THRESHOLD_HIGH = 500
+POWER_THRESHOLD_MEDIUM = 200
+CONFLICT_DETECTION_THRESHOLD = 250
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -583,9 +651,9 @@ def calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, 
             else:
                 power = data[1]
 
-            if power >= 500:
+            if power >= POWER_THRESHOLD_HIGH:
                 high_power.append(power)
-            elif power >= 200:
+            elif power >= POWER_THRESHOLD_MEDIUM:
                 medium_power.append(power)
             else:
                 low_power.append(power)
@@ -610,10 +678,10 @@ def get_pln_tariff(va_option_string):
     tariffs = {
         "900 VA (Subsidi)":      605,
         "900 VA (Non-Subsidi)": 1352,
-        "1300 VA":             1444.70,
-        "2200 VA":             1444.70
+        "1300 VA":             1445,
+        "2200 VA":             1445
     }
-    return tariffs.get(va_option_string, 1444.70)
+    return tariffs.get(va_option_string, 1445)
 
 def calculate_total_power(appliances, appliance_dict):
     """Calculate total power from selected appliances with multi-mode support"""
@@ -1050,7 +1118,16 @@ def predict_daily_curve(model, features, selected_appliances, appliance_dict, va
             pred = float(model.predict(input_df)[0])
             predictions.append(max(pred, 0))
 
-        except Exception:
+        except Exception as e:
+            # [FIX #10] Sebelumnya "except Exception: predictions.append(0)"
+            # menelan SEMUA jenis error tanpa jejak apa pun -- kalau suatu
+            # saat ada bug di pembentukan fitur (mis. key hilang, tipe data
+            # salah), kurva ML akan diam-diam berisi nol di jam tersebut
+            # tanpa pesan error yang bisa dipakai untuk debug. Sekarang
+            # dicatat ke logger (server log / konsol) sebelum tetap fallback
+            # ke 0 -- perilaku curve tidak berubah (tetap tidak crash di
+            # tengah rendering Streamlit), tapi kegagalannya tidak lagi bisu.
+            logger.warning(f"predict_daily_curve: prediksi gagal di jam {hour:02d}:00 -> {type(e).__name__}: {e}")
             predictions.append(0)
 
     return predictions
@@ -1163,11 +1240,9 @@ def _build_appliance_recommendations(
     dan estimasi saving — lalu menghasilkan list of dict rekomendasi.
     """
     recs = []
-    category_labels = {
-        'cost_saving': '\U0001f7e2 Penghematan Biaya',
-        'load_reduction': '\U0001f7e0 Pengurangan Beban',
-        'overload_prevention': '\U0001f534 Pencegahan Overload',
-    }
+    # [FIX #4] Sebelumnya category_labels didefinisikan lokal di sini (dan
+    # sedikit berbeda dari versi di _build_combination_recommendations) --
+    # sekarang pakai CATEGORY_LABELS terpusat di dekat COMBINATION_RULES.
 
     for app_key in appliances:
         if not is_used_fn(app_key):
@@ -1238,23 +1313,40 @@ def _build_appliance_recommendations(
             'action': action,
             'reason': reason,
             'saving': saving,
-            'category': category_labels.get(rec_data['category'], ''),
+            'category': CATEGORY_LABELS.get(rec_data['category'], ''),
             'triggers': triggers,
         })
 
     return recs
 
 
+def _appliances_time_overlap(app_a, app_b, appliance_dict, custom_durations, dayofweek):
+    """[FIX #5] Cek apakah dua alat BENAR-BENAR punya jam operasional yang
+    tumpang tindih, memakai mesin penjadwalan yang sama dengan kurva ML
+    (get_appliance_hourly_load) -- bukan cuma asumsi "kedua-duanya dipakai
+    hari ini" seperti sebelumnya. Sebelumnya COMBINATION_RULES dan
+    get_appliance_hourly_load adalah dua subsistem yang tidak saling
+    berbicara: aturan AC+Setrika bisa menyala walau jadwal heuristik AC
+    (malam) dan Setrika weekday (spillover mulai jam 9 pagi) nyaris tidak
+    pernah bersinggungan.
+    """
+    def _duration_of(app_key):
+        data = appliance_dict[app_key]
+        default_duration = sum(m[2] for m in data[1]) if isinstance(data[1], list) else data[2]
+        return custom_durations.get(app_key, default_duration)
+
+    profile_a = get_appliance_hourly_load(app_a, appliance_dict[app_a], _duration_of(app_a), dayofweek)
+    profile_b = get_appliance_hourly_load(app_b, appliance_dict[app_b], _duration_of(app_b), dayofweek)
+    return any(profile_a[h] > 0 and profile_b[h] > 0 for h in range(24))
+
+
 def _build_combination_recommendations(
     appliances, appliance_dict, custom_durations,
-    utilization, risk, is_used_fn
+    utilization, risk, is_used_fn, dayofweek
 ):
     """Bangun rekomendasi berdasarkan aturan kombinasi antar-alat."""
     recs = []
-    category_labels = {
-        'overload_prevention': '\U0001f534 Pencegahan Overload',
-        'load_reduction': '\U0001f7e0 Pengurangan Beban',
-    }
+    # [FIX #4] CATEGORY_LABELS terpusat (lihat komentar di dekat COMBINATION_RULES).
 
     for rule in COMBINATION_RULES:
         app_a, app_b = rule['pair']
@@ -1264,6 +1356,12 @@ def _build_combination_recommendations(
         if not (is_used_fn(app_a) and is_used_fn(app_b)):
             continue
 
+        # [FIX #5] Cek jadwal aktual dari mesin penjadwalan yang sama
+        # dengan kurva ML, bukan cuma "keduanya dipakai hari ini".
+        overlaps = _appliances_time_overlap(
+            app_a, app_b, appliance_dict, custom_durations, dayofweek
+        )
+
         # Prioritas dinamis berdasarkan risk
         priority = rule['priority']
         if risk in ('OVERLOAD', 'CRITICAL'):
@@ -1271,14 +1369,34 @@ def _build_combination_recommendations(
         elif risk == 'HEAVY' and priority == 'LOW':
             priority = 'MEDIUM'
 
+        if overlaps:
+            action = rule['action']
+            reason = rule['reason']
+            triggers = ['Jadwal pemakaian berpotensi tumpang tindih (estimasi)']
+        else:
+            # Jadwal heuristik bilang kedua alat ini BIASANYA tidak aktif
+            # bersamaan -- turunkan jadi catatan pencegahan umum (bukan
+            # peringatan konflik aktif), tapi JANGAN dihilangkan total:
+            # pengguna tetap bisa menyalakan keduanya di luar kebiasaan,
+            # jadi info keselamatannya tetap relevan sebagai jaga-jaga.
+            priority = 'LOW' if priority != 'HIGH' else 'MEDIUM'
+            action = f"{rule['action']} (di luar jam pemakaian biasa)"
+            reason = (
+                f"{rule['reason']} Catatan: berdasarkan jadwal pemakaian yang "
+                f"Anda atur, kedua alat ini biasanya TIDAK aktif di jam yang "
+                f"sama -- peringatan ini berlaku sebagai jaga-jaga jika Anda "
+                f"menggunakannya di luar kebiasaan tersebut."
+            )
+            triggers = ['Jadwal biasa tidak tumpang tindih -- pencegahan umum']
+
         recs.append({
             'priority': priority,
             'icon': rule['icon'],
-            'action': rule['action'],
-            'reason': rule['reason'],
+            'action': action,
+            'reason': reason,
             'saving': 'Mencegah MCB trip & menjaga stabilitas listrik',
-            'category': category_labels.get(rule['category'], ''),
-            'triggers': ['Kombinasi alat berdaya tinggi'],
+            'category': CATEGORY_LABELS.get(rule['category'], ''),
+            'triggers': triggers,
         })
 
     return recs
@@ -1323,7 +1441,7 @@ def _sort_and_limit_recommendations(recommendations):
     return result
 
 
-def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset, realistic_kw, ml_curve=None, custom_durations=None, tariff=None, breakdown=None, daily_kwh=0.0, appliance_dict=None):
+def generate_recommendations(power_kw, va, house_type, hour, appliances, realistic_kw, ml_curve=None, custom_durations=None, tariff=None, breakdown=None, daily_kwh=0.0, appliance_dict=None, dayofweek=1):
     """
     Generate smart, ML-aware recommendations.
 
@@ -1334,6 +1452,14 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
         breakdown: list of tuples hasil kalkulasi daya dinamis.
         daily_kwh: total kwh harian dari kalkulasi dinamis.
         appliance_dict: dictionary peralatan aktif.
+        dayofweek: 5 (Sabtu/simulasi weekend) atau 1 (Selasa/simulasi
+            weekday) -- dipakai _build_combination_recommendations() untuk
+            cek tumpang tindih jadwal lewat get_appliance_hourly_load(),
+            konsisten dengan konvensi yang sama dipakai predict_daily_curve.
+
+    [FIX #8] Parameter `dataset` yang sebelumnya ada di sini dihapus --
+    dicek lewat grep, tidak pernah dipakai di dalam fungsi ini sama sekali
+    (dead parameter, sisa dari versi lama yang mendukung 2 dataset).
     """
     if appliance_dict is None:
         appliance_dict = APPLIANCES_INDONESIA
@@ -1397,7 +1523,7 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 continue
             data = appliance_dict[app]
             power = max([m[1] for m in data[1]]) if isinstance(data[1], list) else data[1]
-            if power >= 250: # Ambang batas beban besar
+            if power >= CONFLICT_DETECTION_THRESHOLD:  # lihat dokumentasi ambang di dekat COMBINATION_RULES
                 high_power_active.append((data[0], power))
 
     high_power_active = sorted(high_power_active, key=lambda x: x[1], reverse=True)
@@ -1408,7 +1534,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'HIGH', 'icon': '⚠️',
             'action': f'Cegah Benturan Beban: {alat1} & {alat2}',
             'reason': f'Sistem mendeteksi {alat1} ({daya1}W) dan {alat2} ({daya2}W) aktif bersamaan. Penggunaan simultan memakan {daya1+daya2}W. Disarankan memberi jeda 1-2 jam.',
-            'saving': 'Mencegah MCB Trip & Penurunan Umur Kabel'
+            'saving': 'Mencegah MCB Trip & Penurunan Umur Kabel',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': [f'Utilisasi {utilization:.0f}%', 'Dua alat berdaya besar aktif bersamaan'],
         })
 
     # ── 2. Rekomendasi berbasis kurva ML (Peak Shifting) ─────────────────────
@@ -1426,7 +1554,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                     f'Model ML memprediksi puncak konsumsi Anda terjadi jam {peak_hour:02d}:00 '
                     f'({peak_value:.2f} kW). Menggeser operasional AC menghindari Maghrib Peak.'
                 ),
-                'saving': f'~Rp {saving_rp:,.0f}/bulan'
+                'saving': f'~Rp {saving_rp:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('load_reduction', ''),
+                'triggers': [f'Jam puncak ML: {peak_hour:02d}:00', 'AC aktif hari ini'],
             })
 
         if min_hour is not None:
@@ -1439,7 +1569,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                         f'Model ML mendeteksi beban terendah jam {min_hour:02d}:00. '
                         f'Memindahkan peralatan berat ke jam ini menjaga beban tetap seimbang.'
                     ),
-                    'saving': f'~Rp {0.15 * tariff * 30:,.0f}/bulan'
+                    'saving': f'~Rp {0.15 * tariff * 30:,.0f}/bulan',
+                    'category': CATEGORY_LABELS.get('load_reduction', ''),
+                    'triggers': [f'Jam beban terendah ML: {min_hour:02d}:00'],
                 })
 
     # ── 3. Rekomendasi berbasis risk level & Dynamic Savings ──────────────────
@@ -1448,13 +1580,17 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'HIGH', 'icon': '🚨',
             'action': 'MATIKAN peralatan daya besar SEKARANG!',
             'reason': f'Beban {utilization:.0f}% - MCB akan trip! Matikan AC atau setrika segera.',
-            'saving': f'Rp {realistic_kw * 0.3 * tariff * 24:,.0f}/hari'
+            'saving': f'Rp {realistic_kw * 0.3 * tariff * 24:,.0f}/hari',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': [f'Utilisasi {utilization:.0f}% (OVERLOAD)'],
         })
         recommendations.append({
             'priority': 'HIGH', 'icon': '🔴',
             'action': f'Pertimbangkan upgrade daya ke {va*2}VA',
             'reason': f'Kapasitas {va}VA tidak cukup untuk kebutuhan Anda.',
-            'saving': 'Investasi untuk kenyamanan & keamanan'
+            'saving': 'Investasi untuk kenyamanan & keamanan',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': ['Kapasitas VA tidak mencukupi'],
         })
 
     if risk in ["OVERLOAD", "CRITICAL", "HEAVY"]:
@@ -1465,7 +1601,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'HIGH', 'icon': '❄️',
                 'action': 'Gunakan AC secara bijak',
                 'reason': 'Set suhu AC 24-26°C, gunakan timer, dan matikan saat tidak di rumah.',
-                'saving': f'~Rp {ac_cost * 0.2:,.0f}/bulan (hemat 20%)'
+                'saving': f'~Rp {ac_cost * 0.2:,.0f}/bulan (hemat 20%)',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
         if _is_used_today('iron'):
@@ -1475,7 +1613,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'MEDIUM', 'icon': '👔',
                 'action': 'Setrika saat AC mati',
                 'reason': 'Hindari menyetrika bersamaan dengan peralatan berat lainnya.',
-                'saving': f'~Rp {iron_cost * 0.1:,.0f}/bulan'
+                'saving': f'~Rp {iron_cost * 0.1:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('load_reduction', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
         if _is_used_today('rice_cooker'):
@@ -1486,7 +1626,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'MEDIUM', 'icon': '🍚',
                 'action': 'Manajemen Mode Penghangat (Warm) Rice Cooker',
                 'reason': 'Durasi mode Warm yang terlalu lama memakan porsi energi signifikan. Cabut steker jika nasi tinggal sedikit atau saat rumah kosong.',
-                'saving': f'Potensi hemat hingga Rp {potensi_hemat:,.0f}/bulan'
+                'saving': f'Potensi hemat hingga Rp {potensi_hemat:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
     # ── 4. Baseload Profiling (Analisis Beban Dasar) ─────────────────────────
@@ -1504,7 +1646,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'LOW', 'icon': '🔌',
                 'action': 'Evaluasi Beban Siaga (Baseload)',
                 'reason': f'Alat yang menyala 24 jam memakan porsi {baseload_ratio:.1f}% dari total energi harian.',
-                'saving': 'Mereduksi Pemborosan Konstan'
+                'saving': 'Mereduksi Pemborosan Konstan',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Rasio baseload {baseload_ratio:.1f}% (>30%)'],
             })
 
     # ── Rekomendasi berbasis pola beban (bukan jam komputer) ────────────────
@@ -1536,7 +1680,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'MEDIUM', 'icon': '🕐',
             'action': 'Tunda peralatan besar ke jam 22:00+',
             'reason': f'Model ML mendeteksi puncak beban Anda jatuh di rentang Maghrib Peak (17:00-22:00). Menunda penggunaan alat berat{app_list_str} ke larut malam mengurangi risiko MCB trip.',
-            'saving': f'~Rp {saving_monthly:,.0f}/bulan (estimasi optimasi)'
+            'saving': f'~Rp {saving_monthly:,.0f}/bulan (estimasi optimasi)',
+            'category': CATEGORY_LABELS.get('load_reduction', ''),
+            'triggers': [f'Jam puncak: {effective_peak:02d}:00 (Maghrib Peak)'],
         })
 
     if house_type == 'Rumah Pekerja':
@@ -1544,7 +1690,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'LOW', 'icon': '⏰',
             'action': 'Gunakan timer untuk peralatan saat rumah kosong',
             'reason': 'Rumah kosong siang hari. Timer mencegah pemborosan standby.',
-            'saving': f'Rp {1.0 * tariff * 30:,.0f}/bulan'
+            'saving': f'Rp {1.0 * tariff * 30:,.0f}/bulan',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Tipe hunian: Rumah Pekerja (kosong siang hari)'],
         })
 
     if risk in ["NORMAL", "MEDIUM"]:
@@ -1552,13 +1700,17 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'LOW', 'icon': '🔌',
             'action': 'Cabut charger & peralatan standby',
             'reason': 'Phantom load bisa 5-10% dari tagihan. Cabut TV, charger saat tidak dipakai.',
-            'saving': f'Rp {0.2 * 30 * tariff:,.0f}/bulan'
+            'saving': f'Rp {0.2 * 30 * tariff:,.0f}/bulan',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Potensi phantom load'],
         })
         recommendations.append({
             'priority': 'LOW', 'icon': '💡',
             'action': 'Ganti ke lampu LED',
             'reason': 'Lampu LED 80% lebih hemat dari lampu biasa.',
-            'saving': f'Rp {0.5 * tariff * 30:,.0f}/bulan per lampu'
+            'saving': f'Rp {0.5 * tariff * 30:,.0f}/bulan per lampu',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Potensi efisiensi pencahayaan'],
         })
     # ── 5. Rekomendasi Spesifik per Peralatan (Dictionary-Driven) ────────────
     appliance_recs = _build_appliance_recommendations(
@@ -1570,7 +1722,7 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
     # ── 6. Rekomendasi Kombinasi Antar-Alat ──────────────────────────────
     combo_recs = _build_combination_recommendations(
         appliances, appliance_dict, custom_durations,
-        utilization, risk, _is_used_today
+        utilization, risk, _is_used_today, dayofweek
     )
     recommendations.extend(combo_recs)
 
@@ -1923,7 +2075,10 @@ def main():
                 "1300 VA",
                 "2200 VA"
             ],
-            index=2,  # Default: 900 VA Non-Subsidi (paling umum)
+            # [FIX] index=2 sebelumnya menunjuk ke "1300 VA", bukan "900 VA
+            # (Non-Subsidi)" seperti yang dimaksud komentar aslinya. options[1]
+            # adalah "900 VA (Non-Subsidi)" -- itu yang benar untuk index default.
+            index=1,  # Default: 900 VA Non-Subsidi (paling umum)
             help="Pilih golongan tarif sesuai tagihan/struk PLN Anda. 900 VA Subsidi khusus penerima DTKS."
         )
         # Ekstrak nilai integer VA untuk perhitungan teknis
@@ -1984,10 +2139,41 @@ def main():
                     power = max([mode[1] for mode in data[1]])
                 else:
                     power = data[1]
-                
-                # Streamlit automatically binds the checkbox value to st.session_state[key]
-                if st.checkbox(f"{name} ({power}W)", key=key):
-                    selected_appliances.append(key)
+
+                if key in LAMP_TIER_KEYS:
+                    # [FIX Celah Kritis #1 - Phantom Lamp Multiplication]
+                    # lamp_80/120/180 mewakili tiga ASUMSI SKALA untuk sistem
+                    # lampu yang sama, bukan tiga inventaris terpisah. Kalau
+                    # ketiganya boleh dicentang bebas, dayanya dijumlah
+                    # (80+120+180=380W) dan memicu 3 kartu rekomendasi
+                    # terpisah untuk keputusan yang seharusnya satu.
+                    #
+                    # Solusi: tetap checkbox (setara alat lain, sesuai
+                    # preferensi desain), tapi begitu SATU tier lampu
+                    # dicentang, DUA tier lainnya otomatis di-disable
+                    # (abu-abu, tidak bisa diklik) sampai yang aktif itu
+                    # di-uncheck lagi -- meniru perilaku radio button tanpa
+                    # mengubah komponennya.
+                    other_lamp_checked = any(
+                        st.session_state.get(k, False)
+                        for k in LAMP_TIER_KEYS if k != key
+                    )
+                    is_checked = st.checkbox(
+                        f"{name} ({power}W)",
+                        key=key,
+                        disabled=other_lamp_checked,
+                        help="Pilih SATU skala lampu yang paling mewakili rumah Anda. "
+                             "Dua opsi lain otomatis terkunci selama ini masih dicentang."
+                             if not other_lamp_checked else
+                             "Terkunci karena skala lampu lain sudah dipilih. "
+                             "Uncheck opsi itu dulu untuk mengganti skala lampu."
+                    )
+                    if is_checked:
+                        selected_appliances.append(key)
+                else:
+                    # Streamlit automatically binds the checkbox value to st.session_state[key]
+                    if st.checkbox(f"{name} ({power}W)", key=key):
+                        selected_appliances.append(key)
         
         # Duration sliders section (only show if appliances selected)
         if selected_appliances:
@@ -2414,13 +2600,14 @@ def main():
                 st.markdown("### 💡 Rekomendasi Hemat")
                 recommendations = generate_recommendations(
                     current_kw, va, house_type, current_hour,
-                    selected_appliances, dataset, realistic_peak_kw,
+                    selected_appliances, realistic_peak_kw,
                     ml_curve=ml_curve,
                     custom_durations=st.session_state.get('custom_durations', {}),
                     tariff=tariff,
                     breakdown=breakdown,
                     daily_kwh=daily_kwh,
-                    appliance_dict=appliance_dict
+                    appliance_dict=appliance_dict,
+                    dayofweek=5 if is_weekend_sim else 1
                 )
                 
                 for rec in recommendations:
@@ -2647,7 +2834,20 @@ def main():
                 <p><strong>MAE:</strong> 0.1119 kW</p>
                 <p><strong>RMSE:</strong> 0.1431 kW</p>
                 <p><strong>Algoritma:</strong> Random Forest Regressor</p>
-                <p><strong>Fitur:</strong> 19 (sub-metering + temporal + lag + rolling)</p>
+                <!-- [FIX] Sebelumnya tertulis "19" -- sudah tidak sinkron
+                     setelah is_maghrib_peak ditambahkan ke input_dict di
+                     prepare_model_input_for_hour (total sekarang 20 key:
+                     Sub_metering x3, Hour, Dayofweek, Month, Lag x3,
+                     Rolling x3, is_weekend, VA x3, House x3,
+                     is_maghrib_peak). CATATAN PENTING: angka ini mengikuti
+                     apa yang DIBANGUN oleh kode. Kalau model_id.joblib yang
+                     dipakai belum dilatih ulang dengan is_maghrib_peak
+                     sebagai fitur training, baris `input_df[features]`
+                     akan diam-diam membuang key ini (tidak error), dan
+                     fitur ini efektif tidak berpengaruh ke prediksi
+                     walau tampil "20" di sini. Verifikasi len(features)
+                     dari bundle model sebelum sidang untuk memastikan. -->
+                <p><strong>Fitur:</strong> 20 (sub-metering + temporal + lag + rolling + is_maghrib_peak)</p>
                 <p style="color: #764ba2;">📌 Dataset sintetik rumah tangga Indonesia</p>
             </div>
             """, unsafe_allow_html=True)

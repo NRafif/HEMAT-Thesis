@@ -3,16 +3,26 @@
 ========================================================
 
 Enhanced version with:
-- Dataset selection (France vs Indonesia)
-- Model selection (FR and ID)
-- Preset scenarios
+- Model ID (PELITA/Indonesia) — satu-satunya dataset aktif di dashboard ini.
+  [FIX #9] Sebelumnya tertulis "Dataset selection (France vs Indonesia)" dan
+  "Model selection (FR and ID)" sebagai fitur -- ini sudah tidak akurat sejak
+  `is_indonesia = True` di-hardcode di main() dan tidak ada toggle apa pun
+  di UI untuk memilih dataset Prancis. Beberapa fungsi (prepare_model_input_
+  for_hour, predict_daily_curve, generate_pdf_report) masih membawa parameter
+  is_indonesia sebagai sisa infrastruktur dari versi lama yang pernah
+  mendukung 2 dataset -- dipertahankan agar tidak perlu ubah banyak
+  signature, tapi jalur France sudah tidak dapat diakses dari UI.
+- Preset scenarios (Profil Kepemilikan Rumah)
 - Clear analysis logic
-- PDF export
+- PDF export (termasuk konteks simulasi Weekday/Weekend)
 - Analysis button to trigger breakdown
+- Recommendation database (RECOMMENDATION_DB + COMBINATION_RULES) untuk
+  rekomendasi yang lebih personal per alat & kombinasi alat
 
 Author: Nofal Rafif
 """
 
+import logging
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -28,6 +38,12 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+
+# [FIX #10] Logger modul -- dipakai predict_daily_curve() supaya kegagalan
+# prediksi per-jam tidak lagi ditelan diam-diam tanpa jejak (lihat except
+# block di dalam predict_daily_curve untuk detail).
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger("hemat")
 
 # Page config
 st.set_page_config(
@@ -189,6 +205,14 @@ APPLIANCES_INDONESIA = {
     'lamp_180': ('💡 Lampu Rumah Modern', 180, 12),
     'wifi_router': ('📡 Router WiFi', 10, 24)
 }
+
+# [FIX Celah Kritis #1] lamp_80/120/180 merepresentasikan TIGA ASUMSI SKALA
+# PENCAHAYAAN untuk sistem lampu yang SAMA di satu rumah (Sederhana/Menengah/
+# Modern) -- bukan tiga inventaris lampu terpisah yang boleh menyala bareng.
+# Konstanta ini dipakai di sidebar untuk saling mengunci (mutual exclusion)
+# ketiga checkbox tersebut: begitu satu dicentang, dua lainnya di-disable
+# (abu-abu, tidak bisa diklik) sampai yang aktif di-uncheck lagi.
+LAMP_TIER_KEYS = ['lamp_80', 'lamp_120', 'lamp_180']
 
 # Profil kepemilikan — merepresentasikan INVENTARIS rumah, bukan waktu pemakaian.
 # Digunakan untuk mempercepat pengisian form tanpa harus mencentang satu-satu.
@@ -421,7 +445,13 @@ COMBINATION_RULES = [
         'priority': 'HIGH', 'icon': '⚡',
         'action': 'Hindari menyalakan AC dan Setrika bersamaan',
         'reason': (
-            'Keduanya beban tinggi; penggunaan simultan meningkatkan '
+            # [FIX #6] Sebelumnya tertulis "Keduanya beban tinggi" -- AC
+            # (400W) dan Setrika (300W) masuk kategori "sedang" (200-500W)
+            # menurut calculate_realistic_peak sendiri, bukan "tinggi"
+            # (>=500W). Disamakan dengan istilah yang dipakai rule ac+
+            # water_heater di bawah agar konsisten dengan kategorisasi
+            # Simultaneity Factor yang dijelaskan di expander UI.
+            'Keduanya beban sedang-tinggi; penggunaan simultan meningkatkan '
             'risiko MCB trip. Matikan AC sebelum menyetrika.'
         ),
         'category': 'overload_prevention',
@@ -457,6 +487,52 @@ COMBINATION_RULES = [
         'category': 'load_reduction',
     },
 ]
+
+# [FIX #4] Satu-satunya sumber label kategori rekomendasi, dipakai bersama
+# oleh _build_appliance_recommendations() dan _build_combination_recommendations()
+# DAN oleh semua rekomendasi "legacy" hardcoded di generate_recommendations().
+# Sebelumnya ada 2 dict category_labels lokal yang tidak identik (satu di
+# antaranya bahkan tidak punya entri 'cost_saving'), dan rekomendasi legacy
+# tidak diberi 'category'/'triggers' sama sekali -- membuat kartu HIGH-priority
+# (yang justru paling sering dilihat duluan) tampil tanpa badge & pill,
+# sementara kartu sekunder tampil lengkap dengan dekorasi baru.
+CATEGORY_LABELS = {
+    'cost_saving': '\U0001f7e2 Penghematan Biaya',
+    'load_reduction': '\U0001f7e0 Pengurangan Beban',
+    'overload_prevention': '\U0001f534 Pencegahan Overload',
+}
+
+# [FIX #7] Ambang batas "daya besar" dipakai di 3 tempat berbeda dengan nilai
+# berbeda. Ini BUKAN kebetulan/kelalaian -- didokumentasikan di sini sebagai
+# keputusan desain yang disengaja, dengan tujuan masing-masing:
+#
+#   POWER_THRESHOLD_HIGH (500W)   -> dipakai calculate_realistic_peak() untuk
+#                                     kategorisasi faktor kebersamaan heuristik
+#                                     (>=500W = "tinggi", faktor puncak penuh).
+#                                     [FIX B2] Bukan nilai baku IEC 60364 --
+#                                     adaptasi heuristik, lihat docstring
+#                                     calculate_realistic_peak().
+#   POWER_THRESHOLD_MEDIUM (200W) -> ambang bawah kategori "sedang"
+#                                     (>=200W dan <500W) pada fungsi yang sama.
+#   CONFLICT_DETECTION_THRESHOLD (250W) -> ambang KHUSUS untuk deteksi benturan
+#                                     beban generik (Conflict Detection). Sengaja
+#                                     LEBIH RENDAH dari 500W supaya sistem tetap
+#                                     memperingatkan kombinasi alat "sedang" yang
+#                                     jumlahnya signifikan (mis. AC 400W + alat
+#                                     sedang lain), bukan cuma alat kategori
+#                                     "tinggi" murni -- ini pilihan konservatif
+#                                     untuk keselamatan, bukan inkonsistensi.
+#
+# [FIX B3] Definisi eksplisit yang dipakai KONSISTEN di kode, UI, dan PDF:
+#   Daya tinggi : >= 500 W
+#   Daya sedang : >= 200 W dan < 500 W
+#   Daya rendah : < 200 W
+#
+# COMBINATION_RULES sengaja TIDAK punya ambang W sama sekali karena aturannya
+# berbasis pasangan alat spesifik (curated), bukan kategorisasi otomatis.
+POWER_THRESHOLD_HIGH = 500
+POWER_THRESHOLD_MEDIUM = 200
+CONFLICT_DETECTION_THRESHOLD = 250
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -548,11 +624,17 @@ def calculate_utilization(power_kw, va):
     return utilization  # Tidak di-cap 100% agar status BAHAYA bisa terpicu
 
 def calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, va=None, custom_durations=None):
-    """Calculate realistic peak power with simultaneity factor.
-    
-    Menggunakan Simultaneity Factor standar IEC 60364 untuk memperkirakan
-    beban puncak realistis. Tidak ada pemotongan paksa (capping) ke batas MCB
-    agar status OVERLOAD dan CRITICAL tetap bisa terpicu sebagai peringatan.
+    """Calculate realistic peak power with a heuristic simultaneity/coincidence factor.
+
+    [FIX B2] Sebelumnya docstring ini menyebut "Simultaneity Factor standar
+    IEC 60364" -- klaim ini terlalu kuat. Nilai faktor (0.3/0.7/0.9) yang
+    dipakai di bawah adalah ADAPTASI HEURISTIK yang terinspirasi dari prinsip
+    Simultaneity Factor & Diversity Factor pada instalasi listrik tegangan
+    rendah, BUKAN nilai baku yang dikutip langsung dari tabel IEC 60364.
+    Skripsi sudah memakai wording yang lebih hati-hati soal ini -- kode
+    disamakan agar tidak mengklaim lebih kuat dari yang sebenarnya.
+    Tidak ada pemotongan paksa (capping) ke batas MCB agar status OVERLOAD
+    dan CRITICAL tetap bisa terpicu sebagai peringatan.
 
     [FIX Celah Kritis - "Alat Hantu" / Phantom Device Bug]
     Sebelumnya fungsi ini hanya menerima `selected_appliances` (asal
@@ -565,9 +647,13 @@ def calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, 
     """
     custom_durations = custom_durations or {}
 
-    # Kategori beban
-    high_power = []   # >500W
-    medium_power = [] # 200-500W
+    # Kategori beban (batas eksplisit -- lihat POWER_THRESHOLD_* di dekat
+    # COMBINATION_RULES untuk definisi & alasan tiap ambang):
+    #   Daya tinggi : >= 500 W
+    #   Daya sedang : >= 200 W dan < 500 W
+    #   Daya rendah : < 200 W
+    high_power = []   # >=500W
+    medium_power = [] # >=200W dan <500W
     low_power = []    # <200W
 
     for app in selected_appliances:
@@ -583,17 +669,27 @@ def calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, 
             else:
                 power = data[1]
 
-            if power >= 500:
+            if power >= POWER_THRESHOLD_HIGH:
                 high_power.append(power)
-            elif power >= 200:
+            elif power >= POWER_THRESHOLD_MEDIUM:
                 medium_power.append(power)
             else:
                 low_power.append(power)
 
-    # Simultaneity factors (IEC 60364)
-    high_power_peak = max(high_power) if high_power else 0
-    if len(high_power) > 1:
-        high_power_peak += sum(high_power[1:]) * 0.3
+    # Faktor kebersamaan heuristik (bukan nilai baku IEC -- lihat docstring)
+    # [FIX Bug #2 - Laten] Sebelumnya: `max(high_power)` dipakai sebagai
+    # alat "nyala penuh", tapi `high_power[1:]` (untuk faktor cycling 30%)
+    # membuang elemen INDEKS-0 sesuai urutan iterasi selected_appliances --
+    # bukan elemen bernilai maksimum. Kalau elemen maksimum bukan yang
+    # pertama di-iterasi, alat itu terhitung dobel (penuh + 30% lagi) dan
+    # alat lain kehilangan porsi 30%-nya. Aman selama ini murni kebetulan
+    # (air_fryer & microwave sama-sama 800W), rapuh begitu ada alat >=500W
+    # baru dengan watt berbeda. Diurutkan dulu berdasarkan NILAI supaya
+    # elemen terbesar yang konsisten dipilih sebagai "nyala penuh".
+    high_power_sorted = sorted(high_power, reverse=True)
+    high_power_peak = high_power_sorted[0] if high_power_sorted else 0
+    if len(high_power_sorted) > 1:
+        high_power_peak += sum(high_power_sorted[1:]) * 0.3
 
     medium_power_peak = sum(medium_power) * 0.7
     low_power_peak    = sum(low_power) * 0.9
@@ -606,6 +702,14 @@ def get_pln_tariff(va_option_string):
     """Get PLN tariff per kWh based on specific VA category string.
     
     Membedakan 900 VA Subsidi dan Non-Subsidi sesuai Permen ESDM terbaru.
+
+    [FIX O] Sebelumnya fungsi ini mengembalikan 1445 (dibulatkan) untuk
+    1300/2200 VA, sementara fallback tariff di generate_recommendations()
+    memakai 1444.70 (presisi) -- dua sumber nilai berbeda untuk parameter
+    regulasi yang sama. Tidak memicu bug di alur normal (tariff selalu
+    dioper eksplisit dari caller), tapi untuk kebersihan kode disatukan ke
+    SATU nilai sumber presisi (1444.70); pembulatan dilakukan hanya saat
+    ditampilkan ke pengguna (mis. f"Rp {tariff:,.0f}/kWh").
     """
     tariffs = {
         "900 VA (Subsidi)":      605,
@@ -721,7 +825,11 @@ def get_appliance_hourly_load(app_key, data, duration, dayofweek):
     """
     Menghitung profil pemakaian daya per jam (0-23) untuk peralatan tertentu (dalam kW).
     Menggunakan algoritma Time-Anchor Circular Queue dan Sequential Phase Distribution (2 Tahap).
-    Mendukung spillover energi jika melebihi jendela heuristik, serta mematuhi nameplate rating (hukum fisika).
+    Mendukung spillover energi jika melebihi jendela heuristik. Alokasi daya
+    per jam dibatasi pada daya nominal peralatan (nameplate rating) --
+    [FIX B] bukan "hukum fisika": ini adalah aturan pembatas heuristik yang
+    sengaja ditetapkan dalam algoritma penskalaan energi, bukan hukum fisika
+    yang dibuktikan/diturunkan oleh algoritma ini.
     """
     hourly_kw = [0.0] * 24
     
@@ -917,7 +1025,13 @@ def prepare_model_input_for_hour(selected_appliances, appliance_dict, va, house_
             'House_mixed': 1 if house_type == 'Rumah Campuran' else 0,
             'House_retired': 1 if house_type == 'Rumah Pensiunan' else 0,
             'House_working_class': 1 if house_type == 'Rumah Pekerja' else 0,
-            'is_maghrib_peak': 1 if 17 <= hour <= 22 else 0,
+            # [FIX B1] is_maghrib_peak DIHAPUS dari sini -- notebook training
+            # final tidak menyertakan fitur ini di model bundle (19 fitur,
+            # tanpa is_maghrib_peak). Sebelumnya kode tetap membangun key ini
+            # meski akhirnya dibuang oleh `input_df = input_df[features]`
+            # (kolom mati yang tidak berpengaruh ke prediksi) -- dihapus
+            # sekarang supaya kode tidak menyiratkan fitur yang sebenarnya
+            # tidak dipakai model.
         }
     else:
         input_dict = {
@@ -942,8 +1056,17 @@ def prepare_model_input_for_hour(selected_appliances, appliance_dict, va, house_
 
 def build_heuristic_daily_profile(selected_appliances, appliance_dict, custom_durations, dayofweek):
     """
-    Bangun profil daya aktif per jam (0-23) menggunakan logika heuristik dengan sinkronisasi
-    durasi slider (Hukum Konservasi Energi).
+    Bangun profil daya aktif per jam (0-23) menggunakan logika heuristik dengan
+    Penskalaan Energi Proporsional: total energi (kWh) yang dialokasikan ke
+    24 jam disesuaikan dengan durasi slider, dan alokasi per jam dibatasi
+    pada daya nominal peralatan.
+
+    [FIX B] Sebelumnya disebut "Hukum Konservasi Energi" -- istilah ini
+    dilepas karena bisa mengundang pertanyaan "hukum konservasi energi yang
+    mana, dan bagaimana algoritma ini membuktikannya?". Yang sebenarnya
+    terjadi adalah penskalaan/penyaluran energi heuristik (get_appliance_
+    hourly_load) agar total energi sesuai durasi dan tidak melewati daya
+    nominal -- bukan klaim/pembuktian hukum fisika.
     """
     profile = [0.0] * 24
     for app_key in selected_appliances:
@@ -1050,16 +1173,38 @@ def predict_daily_curve(model, features, selected_appliances, appliance_dict, va
             pred = float(model.predict(input_df)[0])
             predictions.append(max(pred, 0))
 
-        except Exception:
+        except Exception as e:
+            # [FIX #10] Sebelumnya "except Exception: predictions.append(0)"
+            # menelan SEMUA jenis error tanpa jejak apa pun -- kalau suatu
+            # saat ada bug di pembentukan fitur (mis. key hilang, tipe data
+            # salah), kurva ML akan diam-diam berisi nol di jam tersebut
+            # tanpa pesan error yang bisa dipakai untuk debug. Sekarang
+            # dicatat ke logger (server log / konsol) sebelum tetap fallback
+            # ke 0 -- perilaku curve tidak berubah (tetap tidak crash di
+            # tengah rendering Streamlit), tapi kegagalannya tidak lagi bisu.
+            logger.warning(f"predict_daily_curve: prediksi gagal di jam {hour:02d}:00 -> {type(e).__name__}: {e}")
             predictions.append(0)
 
     return predictions
 
 # prepare_model_input has been removed as predictions are now unified through predict_daily_curve
 
-def get_input_hash(va, house_type, scenario, appliances):
-    """Generate hash of current input state"""
-    return hash((va, house_type, scenario, tuple(sorted(appliances))))
+def get_input_hash(va, house_type, scenario, appliances, custom_durations=None, is_weekend_sim=False):
+    """Generate hash of current input state.
+
+    [FIX A] Sebelumnya hash hanya dibangun dari (va, house_type, scenario,
+    appliances) -- perubahan slider durasi atau toggle Weekday/Weekend TIDAK
+    dianggap sebagai "input berubah", padahal keduanya nyata-nyata mengubah
+    hasil analisis (kWh harian, kurva ML, rekomendasi). Akibatnya, kalau
+    pengguna sudah menekan "Lakukan Analisis" lalu mengubah durasi/tipe hari
+    TANPA mengubah VA/rumah/skenario/daftar alat, `show_analysis` tidak
+    ter-reset -- walau Streamlit tetap menghitung ulang nilai di baliknya
+    (jadi bukan bug hasil), state "sudah dianalisis" jadi tidak sepenuhnya
+    mencerminkan konfigurasi terkini. custom_durations (dict) diubah ke
+    tuple terurut supaya hashable.
+    """
+    durations_tuple = tuple(sorted((custom_durations or {}).items()))
+    return hash((va, house_type, scenario, tuple(sorted(appliances)), durations_tuple, is_weekend_sim))
 
 # ============================================================================
 # RECOMMENDATION ENGINE HELPERS
@@ -1163,11 +1308,9 @@ def _build_appliance_recommendations(
     dan estimasi saving — lalu menghasilkan list of dict rekomendasi.
     """
     recs = []
-    category_labels = {
-        'cost_saving': '\U0001f7e2 Penghematan Biaya',
-        'load_reduction': '\U0001f7e0 Pengurangan Beban',
-        'overload_prevention': '\U0001f534 Pencegahan Overload',
-    }
+    # [FIX #4] Sebelumnya category_labels didefinisikan lokal di sini (dan
+    # sedikit berbeda dari versi di _build_combination_recommendations) --
+    # sekarang pakai CATEGORY_LABELS terpusat di dekat COMBINATION_RULES.
 
     for app_key in appliances:
         if not is_used_fn(app_key):
@@ -1238,23 +1381,40 @@ def _build_appliance_recommendations(
             'action': action,
             'reason': reason,
             'saving': saving,
-            'category': category_labels.get(rec_data['category'], ''),
+            'category': CATEGORY_LABELS.get(rec_data['category'], ''),
             'triggers': triggers,
         })
 
     return recs
 
 
+def _appliances_time_overlap(app_a, app_b, appliance_dict, custom_durations, dayofweek):
+    """[FIX #5] Cek apakah dua alat BENAR-BENAR punya jam operasional yang
+    tumpang tindih, memakai mesin penjadwalan yang sama dengan kurva ML
+    (get_appliance_hourly_load) -- bukan cuma asumsi "kedua-duanya dipakai
+    hari ini" seperti sebelumnya. Sebelumnya COMBINATION_RULES dan
+    get_appliance_hourly_load adalah dua subsistem yang tidak saling
+    berbicara: aturan AC+Setrika bisa menyala walau jadwal heuristik AC
+    (malam) dan Setrika weekday (spillover mulai jam 9 pagi) nyaris tidak
+    pernah bersinggungan.
+    """
+    def _duration_of(app_key):
+        data = appliance_dict[app_key]
+        default_duration = sum(m[2] for m in data[1]) if isinstance(data[1], list) else data[2]
+        return custom_durations.get(app_key, default_duration)
+
+    profile_a = get_appliance_hourly_load(app_a, appliance_dict[app_a], _duration_of(app_a), dayofweek)
+    profile_b = get_appliance_hourly_load(app_b, appliance_dict[app_b], _duration_of(app_b), dayofweek)
+    return any(profile_a[h] > 0 and profile_b[h] > 0 for h in range(24))
+
+
 def _build_combination_recommendations(
     appliances, appliance_dict, custom_durations,
-    utilization, risk, is_used_fn
+    utilization, risk, is_used_fn, dayofweek
 ):
     """Bangun rekomendasi berdasarkan aturan kombinasi antar-alat."""
     recs = []
-    category_labels = {
-        'overload_prevention': '\U0001f534 Pencegahan Overload',
-        'load_reduction': '\U0001f7e0 Pengurangan Beban',
-    }
+    # [FIX #4] CATEGORY_LABELS terpusat (lihat komentar di dekat COMBINATION_RULES).
 
     for rule in COMBINATION_RULES:
         app_a, app_b = rule['pair']
@@ -1264,6 +1424,12 @@ def _build_combination_recommendations(
         if not (is_used_fn(app_a) and is_used_fn(app_b)):
             continue
 
+        # [FIX #5] Cek jadwal aktual dari mesin penjadwalan yang sama
+        # dengan kurva ML, bukan cuma "keduanya dipakai hari ini".
+        overlaps = _appliances_time_overlap(
+            app_a, app_b, appliance_dict, custom_durations, dayofweek
+        )
+
         # Prioritas dinamis berdasarkan risk
         priority = rule['priority']
         if risk in ('OVERLOAD', 'CRITICAL'):
@@ -1271,14 +1437,34 @@ def _build_combination_recommendations(
         elif risk == 'HEAVY' and priority == 'LOW':
             priority = 'MEDIUM'
 
+        if overlaps:
+            action = rule['action']
+            reason = rule['reason']
+            triggers = ['Jadwal pemakaian berpotensi tumpang tindih (estimasi)']
+        else:
+            # Jadwal heuristik bilang kedua alat ini BIASANYA tidak aktif
+            # bersamaan -- turunkan jadi catatan pencegahan umum (bukan
+            # peringatan konflik aktif), tapi JANGAN dihilangkan total:
+            # pengguna tetap bisa menyalakan keduanya di luar kebiasaan,
+            # jadi info keselamatannya tetap relevan sebagai jaga-jaga.
+            priority = 'LOW' if priority != 'HIGH' else 'MEDIUM'
+            action = f"{rule['action']} (di luar jam pemakaian biasa)"
+            reason = (
+                f"{rule['reason']} Catatan: berdasarkan jadwal pemakaian yang "
+                f"Anda atur, kedua alat ini biasanya TIDAK aktif di jam yang "
+                f"sama -- peringatan ini berlaku sebagai jaga-jaga jika Anda "
+                f"menggunakannya di luar kebiasaan tersebut."
+            )
+            triggers = ['Jadwal biasa tidak tumpang tindih -- pencegahan umum']
+
         recs.append({
             'priority': priority,
             'icon': rule['icon'],
-            'action': rule['action'],
-            'reason': rule['reason'],
+            'action': action,
+            'reason': reason,
             'saving': 'Mencegah MCB trip & menjaga stabilitas listrik',
-            'category': category_labels.get(rule['category'], ''),
-            'triggers': ['Kombinasi alat berdaya tinggi'],
+            'category': CATEGORY_LABELS.get(rule['category'], ''),
+            'triggers': triggers,
         })
 
     return recs
@@ -1323,7 +1509,7 @@ def _sort_and_limit_recommendations(recommendations):
     return result
 
 
-def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset, realistic_kw, ml_curve=None, custom_durations=None, tariff=None, breakdown=None, daily_kwh=0.0, appliance_dict=None):
+def generate_recommendations(power_kw, va, house_type, hour, appliances, realistic_kw, ml_curve=None, custom_durations=None, tariff=None, breakdown=None, daily_kwh=0.0, appliance_dict=None, dayofweek=1):
     """
     Generate smart, ML-aware recommendations.
 
@@ -1334,6 +1520,14 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
         breakdown: list of tuples hasil kalkulasi daya dinamis.
         daily_kwh: total kwh harian dari kalkulasi dinamis.
         appliance_dict: dictionary peralatan aktif.
+        dayofweek: 5 (Sabtu/simulasi weekend) atau 1 (Selasa/simulasi
+            weekday) -- dipakai _build_combination_recommendations() untuk
+            cek tumpang tindih jadwal lewat get_appliance_hourly_load(),
+            konsisten dengan konvensi yang sama dipakai predict_daily_curve.
+
+    [FIX #8] Parameter `dataset` yang sebelumnya ada di sini dihapus --
+    dicek lewat grep, tidak pernah dipakai di dalam fungsi ini sama sekali
+    (dead parameter, sisa dari versi lama yang mendukung 2 dataset).
     """
     if appliance_dict is None:
         appliance_dict = APPLIANCES_INDONESIA
@@ -1351,6 +1545,10 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
     recommendations = []
     utilization = calculate_utilization(realistic_kw, va)
     if tariff is None:
+        # [FIX O] Fallback ini sekarang identik dengan nilai sumber di
+        # get_pln_tariff() untuk 1300/2200 VA -- satu nilai kanonik.
+        # Praktiknya jarang terpakai karena tariff selalu dioper eksplisit
+        # dari caller (main()), ini murni jaga-jaga.
         tariff = 1444.70
 
     # ── Analisis kurva ML jika tersedia ─────────────────────────────────────
@@ -1397,7 +1595,7 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 continue
             data = appliance_dict[app]
             power = max([m[1] for m in data[1]]) if isinstance(data[1], list) else data[1]
-            if power >= 250: # Ambang batas beban besar
+            if power >= CONFLICT_DETECTION_THRESHOLD:  # lihat dokumentasi ambang di dekat COMBINATION_RULES
                 high_power_active.append((data[0], power))
 
     high_power_active = sorted(high_power_active, key=lambda x: x[1], reverse=True)
@@ -1408,7 +1606,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'HIGH', 'icon': '⚠️',
             'action': f'Cegah Benturan Beban: {alat1} & {alat2}',
             'reason': f'Sistem mendeteksi {alat1} ({daya1}W) dan {alat2} ({daya2}W) aktif bersamaan. Penggunaan simultan memakan {daya1+daya2}W. Disarankan memberi jeda 1-2 jam.',
-            'saving': 'Mencegah MCB Trip & Penurunan Umur Kabel'
+            'saving': 'Mencegah MCB Trip & Penurunan Umur Kabel',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': [f'Utilisasi {utilization:.0f}%', 'Dua alat berdaya besar aktif bersamaan'],
         })
 
     # ── 2. Rekomendasi berbasis kurva ML (Peak Shifting) ─────────────────────
@@ -1426,7 +1626,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                     f'Model ML memprediksi puncak konsumsi Anda terjadi jam {peak_hour:02d}:00 '
                     f'({peak_value:.2f} kW). Menggeser operasional AC menghindari Maghrib Peak.'
                 ),
-                'saving': f'~Rp {saving_rp:,.0f}/bulan'
+                'saving': f'~Rp {saving_rp:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('load_reduction', ''),
+                'triggers': [f'Jam puncak ML: {peak_hour:02d}:00', 'AC aktif hari ini'],
             })
 
         if min_hour is not None:
@@ -1439,7 +1641,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                         f'Model ML mendeteksi beban terendah jam {min_hour:02d}:00. '
                         f'Memindahkan peralatan berat ke jam ini menjaga beban tetap seimbang.'
                     ),
-                    'saving': f'~Rp {0.15 * tariff * 30:,.0f}/bulan'
+                    'saving': f'~Rp {0.15 * tariff * 30:,.0f}/bulan',
+                    'category': CATEGORY_LABELS.get('load_reduction', ''),
+                    'triggers': [f'Jam beban terendah ML: {min_hour:02d}:00'],
                 })
 
     # ── 3. Rekomendasi berbasis risk level & Dynamic Savings ──────────────────
@@ -1448,13 +1652,17 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'HIGH', 'icon': '🚨',
             'action': 'MATIKAN peralatan daya besar SEKARANG!',
             'reason': f'Beban {utilization:.0f}% - MCB akan trip! Matikan AC atau setrika segera.',
-            'saving': f'Rp {realistic_kw * 0.3 * tariff * 24:,.0f}/hari'
+            'saving': f'Rp {realistic_kw * 0.3 * tariff * 24:,.0f}/hari',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': [f'Utilisasi {utilization:.0f}% (OVERLOAD)'],
         })
         recommendations.append({
             'priority': 'HIGH', 'icon': '🔴',
             'action': f'Pertimbangkan upgrade daya ke {va*2}VA',
             'reason': f'Kapasitas {va}VA tidak cukup untuk kebutuhan Anda.',
-            'saving': 'Investasi untuk kenyamanan & keamanan'
+            'saving': 'Investasi untuk kenyamanan & keamanan',
+            'category': CATEGORY_LABELS.get('overload_prevention', ''),
+            'triggers': ['Kapasitas VA tidak mencukupi'],
         })
 
     if risk in ["OVERLOAD", "CRITICAL", "HEAVY"]:
@@ -1465,7 +1673,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'HIGH', 'icon': '❄️',
                 'action': 'Gunakan AC secara bijak',
                 'reason': 'Set suhu AC 24-26°C, gunakan timer, dan matikan saat tidak di rumah.',
-                'saving': f'~Rp {ac_cost * 0.2:,.0f}/bulan (hemat 20%)'
+                'saving': f'~Rp {ac_cost * 0.2:,.0f}/bulan (hemat 20%)',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
         if _is_used_today('iron'):
@@ -1475,7 +1685,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'MEDIUM', 'icon': '👔',
                 'action': 'Setrika saat AC mati',
                 'reason': 'Hindari menyetrika bersamaan dengan peralatan berat lainnya.',
-                'saving': f'~Rp {iron_cost * 0.1:,.0f}/bulan'
+                'saving': f'~Rp {iron_cost * 0.1:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('load_reduction', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
         if _is_used_today('rice_cooker'):
@@ -1486,7 +1698,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'MEDIUM', 'icon': '🍚',
                 'action': 'Manajemen Mode Penghangat (Warm) Rice Cooker',
                 'reason': 'Durasi mode Warm yang terlalu lama memakan porsi energi signifikan. Cabut steker jika nasi tinggal sedikit atau saat rumah kosong.',
-                'saving': f'Potensi hemat hingga Rp {potensi_hemat:,.0f}/bulan'
+                'saving': f'Potensi hemat hingga Rp {potensi_hemat:,.0f}/bulan',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Status beban: {risk}'],
             })
 
     # ── 4. Baseload Profiling (Analisis Beban Dasar) ─────────────────────────
@@ -1504,7 +1718,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
                 'priority': 'LOW', 'icon': '🔌',
                 'action': 'Evaluasi Beban Siaga (Baseload)',
                 'reason': f'Alat yang menyala 24 jam memakan porsi {baseload_ratio:.1f}% dari total energi harian.',
-                'saving': 'Mereduksi Pemborosan Konstan'
+                'saving': 'Mereduksi Pemborosan Konstan',
+                'category': CATEGORY_LABELS.get('cost_saving', ''),
+                'triggers': [f'Rasio baseload {baseload_ratio:.1f}% (>30%)'],
             })
 
     # ── Rekomendasi berbasis pola beban (bukan jam komputer) ────────────────
@@ -1536,7 +1752,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'MEDIUM', 'icon': '🕐',
             'action': 'Tunda peralatan besar ke jam 22:00+',
             'reason': f'Model ML mendeteksi puncak beban Anda jatuh di rentang Maghrib Peak (17:00-22:00). Menunda penggunaan alat berat{app_list_str} ke larut malam mengurangi risiko MCB trip.',
-            'saving': f'~Rp {saving_monthly:,.0f}/bulan (estimasi optimasi)'
+            'saving': f'~Rp {saving_monthly:,.0f}/bulan (estimasi optimasi)',
+            'category': CATEGORY_LABELS.get('load_reduction', ''),
+            'triggers': [f'Jam puncak: {effective_peak:02d}:00 (Maghrib Peak)'],
         })
 
     if house_type == 'Rumah Pekerja':
@@ -1544,7 +1762,9 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'LOW', 'icon': '⏰',
             'action': 'Gunakan timer untuk peralatan saat rumah kosong',
             'reason': 'Rumah kosong siang hari. Timer mencegah pemborosan standby.',
-            'saving': f'Rp {1.0 * tariff * 30:,.0f}/bulan'
+            'saving': f'Rp {1.0 * tariff * 30:,.0f}/bulan',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Tipe hunian: Rumah Pekerja (kosong siang hari)'],
         })
 
     if risk in ["NORMAL", "MEDIUM"]:
@@ -1552,13 +1772,17 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
             'priority': 'LOW', 'icon': '🔌',
             'action': 'Cabut charger & peralatan standby',
             'reason': 'Phantom load bisa 5-10% dari tagihan. Cabut TV, charger saat tidak dipakai.',
-            'saving': f'Rp {0.2 * 30 * tariff:,.0f}/bulan'
+            'saving': f'Rp {0.2 * 30 * tariff:,.0f}/bulan',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Potensi phantom load'],
         })
         recommendations.append({
             'priority': 'LOW', 'icon': '💡',
             'action': 'Ganti ke lampu LED',
             'reason': 'Lampu LED 80% lebih hemat dari lampu biasa.',
-            'saving': f'Rp {0.5 * tariff * 30:,.0f}/bulan per lampu'
+            'saving': f'Rp {0.5 * tariff * 30:,.0f}/bulan per lampu',
+            'category': CATEGORY_LABELS.get('cost_saving', ''),
+            'triggers': ['Potensi efisiensi pencahayaan'],
         })
     # ── 5. Rekomendasi Spesifik per Peralatan (Dictionary-Driven) ────────────
     appliance_recs = _build_appliance_recommendations(
@@ -1570,7 +1794,7 @@ def generate_recommendations(power_kw, va, house_type, hour, appliances, dataset
     # ── 6. Rekomendasi Kombinasi Antar-Alat ──────────────────────────────
     combo_recs = _build_combination_recommendations(
         appliances, appliance_dict, custom_durations,
-        utilization, risk, _is_used_today
+        utilization, risk, _is_used_today, dayofweek
     )
     recommendations.extend(combo_recs)
 
@@ -1785,17 +2009,25 @@ def generate_pdf_report(
     story.append(PageBreak())
     
     # Section 5: Simultaneity Factor Explanation
-    story.append(Paragraph("📊 TENTANG SIMULTANEITY FACTOR", heading_style))
+    story.append(Paragraph("📊 TENTANG FAKTOR KEBERSAMAAN (SIMULTANEITY)", heading_style))
     story.append(Paragraph(
-        f"Sistem menggunakan Simultaneity Factor berdasarkan standar IEC 60364. "
-        f"Tidak semua peralatan nyala 100% bersamaan dalam kondisi normal:",
+        # [FIX B2] Sebelumnya "berdasarkan standar IEC 60364" -- klaim ini
+        # terlalu kuat karena nilai faktor (30%/70%/90%) adalah adaptasi
+        # heuristik, bukan dikutip langsung dari tabel baku IEC. Wording
+        # disamakan dengan skripsi.
+        f"Sistem menggunakan faktor kebersamaan berbasis heuristik yang diadaptasi dari "
+        f"prinsip Simultaneity Factor dan Diversity Factor pada instalasi listrik tegangan "
+        f"rendah. Tidak semua peralatan nyala 100% bersamaan dalam kondisi normal:",
         normal_style
     ))
     
     simul_data = [
         ['Kategori', 'Simultaneity', 'Penjelasan'],
-        ['Daya Tinggi (>500W)', '100% + 30%', 'Hanya 1 nyala penuh, lainnya cycling'],
-        ['Daya Sedang (200-500W)', '70%', 'Sebagian besar nyala bersamaan'],
+        # [FIX B3] Batas eksplisit (>=/< ) supaya tidak ambigu untuk alat
+        # tepat 500W atau 200W -- konsisten dengan kode (POWER_THRESHOLD_HIGH
+        # = 500, POWER_THRESHOLD_MEDIUM = 200 di calculate_realistic_peak).
+        ['Daya Tinggi (\u2265500W)', '100% + 30%', 'Hanya 1 nyala penuh, lainnya cycling'],
+        ['Daya Sedang (\u2265200W dan <500W)', '70%', 'Sebagian besar nyala bersamaan'],
         ['Daya Rendah (<200W)', '90%', 'Hampir selalu nyala'],
     ]
     
@@ -1868,7 +2100,9 @@ def generate_pdf_report(
     
     story.append(Paragraph(f"Laporan dibuat oleh H.E.M.A.T", footer_style))
     story.append(Paragraph(f"© 2026 Nofal Rafif - Universitas Pamulang", footer_style))
-    story.append(Paragraph(f"Disclaimer: Estimasi biaya berdasarkan asumsi pemakaian rata-rata dengan Simultaneity Factor IEC 60364. Biaya aktual dapat bervariasi.", footer_style))
+    # [FIX B2] Sebelumnya "Simultaneity Factor IEC 60364" -- disamakan
+    # dengan wording skripsi (faktor kebersamaan adaptasi heuristik).
+    story.append(Paragraph(f"Disclaimer: Estimasi biaya berdasarkan asumsi pemakaian rata-rata dengan faktor kebersamaan heuristik yang diadaptasi dari prinsip Simultaneity Factor. Biaya aktual dapat bervariasi.", footer_style))
     
     # Build PDF
     doc.build(story)
@@ -1923,7 +2157,10 @@ def main():
                 "1300 VA",
                 "2200 VA"
             ],
-            index=2,  # Default: 900 VA Non-Subsidi (paling umum)
+            # [FIX] index=2 sebelumnya menunjuk ke "1300 VA", bukan "900 VA
+            # (Non-Subsidi)" seperti yang dimaksud komentar aslinya. options[1]
+            # adalah "900 VA (Non-Subsidi)" -- itu yang benar untuk index default.
+            index=1,  # Default: 900 VA Non-Subsidi (paling umum)
             help="Pilih golongan tarif sesuai tagihan/struk PLN Anda. 900 VA Subsidi khusus penerima DTKS."
         )
         # Ekstrak nilai integer VA untuk perhitungan teknis
@@ -1984,10 +2221,41 @@ def main():
                     power = max([mode[1] for mode in data[1]])
                 else:
                     power = data[1]
-                
-                # Streamlit automatically binds the checkbox value to st.session_state[key]
-                if st.checkbox(f"{name} ({power}W)", key=key):
-                    selected_appliances.append(key)
+
+                if key in LAMP_TIER_KEYS:
+                    # [FIX Celah Kritis #1 - Phantom Lamp Multiplication]
+                    # lamp_80/120/180 mewakili tiga ASUMSI SKALA untuk sistem
+                    # lampu yang sama, bukan tiga inventaris terpisah. Kalau
+                    # ketiganya boleh dicentang bebas, dayanya dijumlah
+                    # (80+120+180=380W) dan memicu 3 kartu rekomendasi
+                    # terpisah untuk keputusan yang seharusnya satu.
+                    #
+                    # Solusi: tetap checkbox (setara alat lain, sesuai
+                    # preferensi desain), tapi begitu SATU tier lampu
+                    # dicentang, DUA tier lainnya otomatis di-disable
+                    # (abu-abu, tidak bisa diklik) sampai yang aktif itu
+                    # di-uncheck lagi -- meniru perilaku radio button tanpa
+                    # mengubah komponennya.
+                    other_lamp_checked = any(
+                        st.session_state.get(k, False)
+                        for k in LAMP_TIER_KEYS if k != key
+                    )
+                    is_checked = st.checkbox(
+                        f"{name} ({power}W)",
+                        key=key,
+                        disabled=other_lamp_checked,
+                        help="Pilih SATU skala lampu yang paling mewakili rumah Anda. "
+                             "Dua opsi lain otomatis terkunci selama ini masih dicentang."
+                             if not other_lamp_checked else
+                             "Terkunci karena skala lampu lain sudah dipilih. "
+                             "Uncheck opsi itu dulu untuk mengganti skala lampu."
+                    )
+                    if is_checked:
+                        selected_appliances.append(key)
+                else:
+                    # Streamlit automatically binds the checkbox value to st.session_state[key]
+                    if st.checkbox(f"{name} ({power}W)", key=key):
+                        selected_appliances.append(key)
         
         # Duration sliders section (only show if appliances selected)
         if selected_appliances:
@@ -2035,14 +2303,20 @@ def main():
     # TAB 1: DASHBOARD
     # ========================================================================
     with tab1:
+        # Calculate power with custom durations from sliders
+        # [FIX A] Diambil SEBELUM cek hash sekarang (dipindah dari bawah),
+        # supaya bisa ikut dimasukkan ke get_input_hash().
+        custom_durations = st.session_state.get('custom_durations', {})
+
         # Check if input changed - if yes, reset analysis
-        current_input_hash = get_input_hash(va_option, house_type, selected_scenario, selected_appliances)
+        current_input_hash = get_input_hash(
+            va_option, house_type, selected_scenario, selected_appliances,
+            custom_durations=custom_durations, is_weekend_sim=is_weekend_sim
+        )
         if st.session_state.last_input_hash != current_input_hash:
             st.session_state.show_analysis = False
             st.session_state.last_input_hash = current_input_hash
-        
-        # Calculate power with custom durations from sliders
-        custom_durations = st.session_state.get('custom_durations', {})
+
         instant_watt, daily_kwh, breakdown = calculate_total_power_dynamic(
             selected_appliances, appliance_dict, custom_durations
         )
@@ -2061,557 +2335,568 @@ def main():
         
         # Only show metrics if there are selected appliances
         if len(selected_appliances) == 0:
+            # [FIX Bug #1 - Kritis] Sebelumnya baris ini `return` --
+            # itu keluar dari SELURUH main(), bukan cuma blok `with tab1:`,
+            # karena `with` bukan scope seperti fungsi. Akibatnya Tab 2
+            # (Analisis Model) dan Tab 3 (Tentang) tidak pernah ter-render
+            # sama sekali setiap kali selected_appliances kosong --
+            # termasuk kondisi default saat aplikasi pertama dibuka.
+            # Diganti jadi if/else supaya main() tetap lanjut merender
+            # tab2 & tab3 walau belum ada alat dicentang di tab1.
             st.info("👈 Silakan pilih peralatan di sidebar untuk mulai menganalisis konsumsi energi Anda")
-            return
+        else:
         
-        # Metrics
-        current_hour = datetime.now().hour
+            # Metrics
+            current_hour = datetime.now().hour
         
-        # Calculate heuristic profile for dynamic manual hourly power comparison (Apple-to-Apple)
-        heuristic_profile = build_heuristic_daily_profile(
-            selected_appliances, appliance_dict, custom_durations, dayofweek=5 if is_weekend_sim else 1
-        )
-        current_kw_heur = heuristic_profile[current_hour]
+            # Calculate heuristic profile for dynamic manual hourly power comparison (Apple-to-Apple)
+            heuristic_profile = build_heuristic_daily_profile(
+                selected_appliances, appliance_dict, custom_durations, dayofweek=5 if is_weekend_sim else 1
+            )
+            current_kw_heur = heuristic_profile[current_hour]
         
-        # Calculate REALISTIC peak (with simultaneity)
-        realistic_peak_watt = calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, va=va, custom_durations=custom_durations)
-        realistic_peak_kw = realistic_peak_watt / 1000
+            # Calculate REALISTIC peak (with simultaneity)
+            realistic_peak_watt = calculate_realistic_peak(instant_watt, selected_appliances, appliance_dict, va=va, custom_durations=custom_durations)
+            realistic_peak_kw = realistic_peak_watt / 1000
         
-        utilization_worst = calculate_utilization(current_kw, va)  # Jika SEMUA nyala
-        utilization_realistic = calculate_utilization(realistic_peak_kw, va)  # Realistis
+            utilization_worst = calculate_utilization(current_kw, va)  # Jika SEMUA nyala
+            utilization_realistic = calculate_utilization(realistic_peak_kw, va)  # Realistis
         
-        risk_level, risk_class, risk_text = get_risk_level(utilization_realistic)
+            risk_level, risk_class, risk_text = get_risk_level(utilization_realistic)
         
-        # Calculate cost correctly based on ACTUAL daily usage
-        tariff = get_pln_tariff(va_option)  # Gunakan string golongan tarif
-        daily_cost = daily_kwh * tariff      # kWh harian × Rp/kWh
-        monthly_cost = daily_cost * 30       # Asumsi prabayar/token (30 hari)
+            # Calculate cost correctly based on ACTUAL daily usage
+            tariff = get_pln_tariff(va_option)  # Gunakan string golongan tarif
+            daily_cost = daily_kwh * tariff      # kWh harian × Rp/kWh
+            monthly_cost = daily_cost * 30       # Asumsi prabayar/token (30 hari)
         
-        col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4 = st.columns(4)
         
-        with col1:
-            st.markdown(f"""
-            <div class="metric-card">
-                <h4 style="color: #666; margin: 0;">💡 Daya Terpasang</h4>
-                <h2 style="color: #667eea; margin: 10px 0;">{va} VA</h2>
-                <p style="color: #999; margin: 0;">Tarif: Rp {tariff:,}/kWh</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown(f"""
-            <div class="metric-card">
-                <h4 style="color: #666; margin: 0;">⚡ Daya Puncak</h4>
-                <h2 style="color: #667eea; margin: 10px 0;">{realistic_peak_kw:.2f} kW</h2>
-                <p style="color: #999; margin: 0;">{realistic_peak_watt:,.0f}W (realistis) | {instant_watt:,}W (teoritis)</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown(f"""
-            <div class="metric-card">
-                <h4 style="color: #666; margin: 0;">💰 Estimasi Biaya</h4>
-                <h2 style="color: #667eea; margin: 10px 0;">Rp {daily_cost:,.0f}/hari</h2>
-                <p style="color: #999; margin: 0;">~Rp {monthly_cost:,.0f}/bulan ({daily_kwh:.2f} kWh/hari)</p>
-                <p style="color: #bbb; margin: 2px 0; font-size: 0.78rem;">*Asumsi Prabayar/Token</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col4:
-            # Determine display message based on risk level
-            if risk_level == "BAHAYA":
-                status_msg = "OVERLOAD - Risiko Trip!"
-            elif risk_level == "KRITIS":
-                status_msg = "Hampir Penuh"
-            elif risk_level == "BERAT":
-                status_msg = "Beban Tinggi"
-            elif risk_level == "PERHATIAN":
-                status_msg = "Beban Sedang"
-            else:
-                status_msg = "Beban Normal"
-            
-            st.markdown(f"""
-            <div class="metric-card {risk_class}">
-                <h4 style="margin: 0;">Status Beban</h4>
-                <h2 style="margin: 10px 0;">{risk_text}</h2>
-                <p style="margin: 0;">{status_msg}</p>
-                <p style="margin: 5px 0; font-size: 0.85rem;">{utilization_realistic:.1f}% kapasitas</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Analysis button
-        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
-        with col_btn2:
-            if st.button("🔍 Lakukan Analisis", use_container_width=True, type="primary"):
-                st.session_state.show_analysis = True
-                st.rerun()
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Show analysis only if button clicked
-        if st.session_state.show_analysis:
-            # Load model
-            dataset_type = "indonesia" if is_indonesia else "france"
-            model, features = load_model(dataset_type)
-            
-            ml_prediction = None
-            ml_curve = None
-            prediction_method = "Perhitungan Manual"
-            
-            if model is not None and features is not None:
-                with st.spinner('🔮 Menganalisis pola 24 jam dengan ML model...'):
-                    import time
-                    ml_curve = predict_daily_curve(
-                        model, features, selected_appliances, appliance_dict,
-                        va, house_type, is_indonesia, is_weekend=is_weekend_sim,
-                        custom_durations=st.session_state.get('custom_durations', {})
-                    )
-                    
-                    if ml_curve and any(v > 0 for v in ml_curve):
-                        # Ambil prediksi spesifik untuk jam SAAT INI langsung dari kurva
-                        ml_prediction = ml_curve[current_hour]
-                        prediction_method = f"Machine Learning Model ({selected_model})"
-                        
-                    # Add delay to show processing
-                    time.sleep(0.8)
-            
-            # Use ML prediction if available, else use calculated heuristic
-            predicted_instant_kw = ml_prediction if ml_prediction is not None else current_kw_heur
-            
-            # Analysis Logic Section
-            st.markdown("### 🔍 Analisis Sistem")
-            
-            # Show prediction comparison
-            if ml_prediction is not None:
-                col_pred1, col_pred2 = st.columns(2)
-                with col_pred1:
-                    st.metric(
-                        "🤖 Prediksi ML Model (Jam Ini)", 
-                        f"{predicted_instant_kw:.3f} kW",
-                        help="Prediksi konsumsi daya realistis dari model ML pada jam berjalan"
-                    )
-                with col_pred2:
-                    st.metric(
-                        "🧮 Manual Dinamis (Jam Ini)", 
-                        f"{current_kw_heur:.3f} kW",
-                        help="Estimasi manual konsumsi daya berdasarkan jadwal aktif peralatan pada jam berjalan"
-                    )
-                
-                # Show difference
-                diff_percent = abs(predicted_instant_kw - current_kw_heur) / max(current_kw_heur, 0.001) * 100
-                if diff_percent < 15:
-                    st.success(f"✅ Model ML dan estimasi manual jam ini sangat sesuai (selisih {diff_percent:.1f}%)")
-                else:
-                    st.info(f"ℹ️ Selisih {diff_percent:.1f}% — Model ML menyesuaikan dengan faktor temporal eksternal & lag konsumsi")
-                
-                st.caption("⚠️ Catatan: Perbandingan di atas bersifat Apple-to-Apple pada jam berjalan, bukan membandingkan total seluruh daya peralatan rumah.")
-            
-            # ==================================================================
-            # 📈 DAILY LOAD CURVE - The KEY ML Feature
-            # ==================================================================
-            st.markdown("### 📈 Prediksi Konsumsi 24 Jam (ML)")
-            st.caption("Grafik ini menunjukkan bagaimana model ML memprediksi pola konsumsi Anda sepanjang hari")
-            
-            if ml_curve and any(v > 0 for v in ml_curve):
-                # Static line (flat calculation for comparison)
-                static_line = [current_kw] * 24
-                
-                hours = list(range(24))
-                hour_labels = [f"{h:02d}:00" for h in hours]
-                
-                # Create the chart
-                fig_curve = go.Figure()
-                
-                # ML Prediction curve
-                fig_curve.add_trace(go.Scatter(
-                    x=hour_labels,
-                    y=ml_curve,
-                    mode='lines+markers',
-                    name='Prediksi ML',
-                    line=dict(color='#667eea', width=3),
-                    marker=dict(size=6),
-                    fill='tozeroy',
-                    fillcolor='rgba(102, 126, 234, 0.2)'
-                ))
-                
-                # Static calculation line
-                fig_curve.add_trace(go.Scatter(
-                    x=hour_labels,
-                    y=static_line,
-                    mode='lines',
-                    name='Kalkulator Statis',
-                    line=dict(color='#888', width=2, dash='dash')
-                ))
-                
-                # Capacity limit line
-                max_capacity = (va * 0.85) / 1000
-                fig_curve.add_trace(go.Scatter(
-                    x=hour_labels,
-                    y=[max_capacity] * 24,
-                    mode='lines',
-                    name=f'Batas Aman ({va}VA)',
-                    line=dict(color='#eb3349', width=2, dash='dot')
-                ))
-                
-                # Highlight peak hours (17:00-22:00)
-                fig_curve.add_vrect(
-                    x0="17:00", x1="22:00",
-                    fillcolor="rgba(235, 51, 73, 0.1)",
-                    layer="below",
-                    line_width=0,
-                    annotation_text="Peak Hours",
-                    annotation_position="top left"
-                )
-                
-                fig_curve.update_layout(
-                    title=f"Pola Konsumsi Harian - {'Weekend' if is_weekend_sim else 'Weekday'}",
-                    xaxis_title="Jam",
-                    yaxis_title="Konsumsi (kW)",
-                    height=400,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    hovermode='x unified'
-                )
-                
-                st.plotly_chart(fig_curve, use_container_width=True)
-                
-                # Key insight box
-                peak_hour = ml_curve.index(max(ml_curve))
-                min_hour = ml_curve.index(min(ml_curve))
-                peak_value = max(ml_curve)
-                
+            with col1:
                 st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); 
-                            padding: 15px; border-radius: 10px; color: white;">
-                    <strong style="color: white;">🎯 Insight dari Model ML:</strong><br>
-                    • Jam puncak diprediksi: <strong>{peak_hour:02d}:00</strong> ({peak_value:.2f} kW)<br>
-                    • Jam paling efisien: <strong>{min_hour:02d}:00</strong><br>
-                    • Ini berbeda dari kalkulator biasa yang menganggap beban konstan sepanjang hari.
+                <div class="metric-card">
+                    <h4 style="color: #666; margin: 0;">💡 Daya Terpasang</h4>
+                    <h2 style="color: #667eea; margin: 10px 0;">{va} VA</h2>
+                    <p style="color: #999; margin: 0;">Tarif: Rp {tariff:,}/kWh</p>
                 </div>
                 """, unsafe_allow_html=True)
-            else:
-                st.info("📊 Model ML tidak tersedia atau mengembalikan prediksi kosong. Menggunakan estimasi daya statis.")
+        
+            with col2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h4 style="color: #666; margin: 0;">⚡ Daya Puncak</h4>
+                    <h2 style="color: #667eea; margin: 10px 0;">{realistic_peak_kw:.2f} kW</h2>
+                    <p style="color: #999; margin: 0;">{realistic_peak_watt:,.0f}W (realistis) | {instant_watt:,}W (teoritis)</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            with col3:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h4 style="color: #666; margin: 0;">💰 Estimasi Biaya</h4>
+                    <h2 style="color: #667eea; margin: 10px 0;">Rp {daily_cost:,.0f}/hari</h2>
+                    <p style="color: #999; margin: 0;">~Rp {monthly_cost:,.0f}/bulan ({daily_kwh:.2f} kWh/hari)</p>
+                    <p style="color: #bbb; margin: 2px 0; font-size: 0.78rem;">*Asumsi Prabayar/Token</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            with col4:
+                # Determine display message based on risk level
+                if risk_level == "BAHAYA":
+                    status_msg = "OVERLOAD - Risiko Trip!"
+                elif risk_level == "KRITIS":
+                    status_msg = "Hampir Penuh"
+                elif risk_level == "BERAT":
+                    status_msg = "Beban Tinggi"
+                elif risk_level == "PERHATIAN":
+                    status_msg = "Beban Sedang"
+                else:
+                    status_msg = "Beban Normal"
             
+                st.markdown(f"""
+                <div class="metric-card {risk_class}">
+                    <h4 style="margin: 0;">Status Beban</h4>
+                    <h2 style="margin: 10px 0;">{risk_text}</h2>
+                    <p style="margin: 0;">{status_msg}</p>
+                    <p style="margin: 5px 0; font-size: 0.85rem;">{utilization_realistic:.1f}% kapasitas</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
             st.markdown("<br>", unsafe_allow_html=True)
+        
+            # Analysis button
+            col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+            with col_btn2:
+                if st.button("🔍 Lakukan Analisis", use_container_width=True, type="primary"):
+                    st.session_state.show_analysis = True
+                    st.rerun()
+        
+            st.markdown("<br>", unsafe_allow_html=True)
+        
+            # Show analysis only if button clicked
+            if st.session_state.show_analysis:
+                # Load model
+                dataset_type = "indonesia" if is_indonesia else "france"
+                model, features = load_model(dataset_type)
             
-            # Analysis box dengan native Streamlit (bukan HTML)
-            st.markdown("### 📝 Evaluasi Rumah Tangga")
+                ml_prediction = None
+                ml_curve = None
+                prediction_method = "Perhitungan Manual"
             
-            # Create columns for better layout
-            analysis_col1, analysis_col2 = st.columns([1, 1])
-            
-            with analysis_col1:
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            padding: 20px; border-radius: 10px; color: white; margin-bottom: 10px;">
-                    <h4 style="color: white; margin-top: 0;">📊 Peralatan & Konsumsi</h4>
-                    <p style="color: white; margin: 5px 0;">✓ Peralatan Dimiliki: <strong>{len(selected_appliances)} item</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Konsumsi Harian: <strong>{daily_kwh:.2f} kWh/hari</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Biaya Harian: <strong>Rp {daily_cost:,.0f}</strong></p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            padding: 20px; border-radius: 10px; color: white;">
-                    <h4 style="color: white; margin-top: 0;">⚡ Beban Listrik</h4>
-                    <p style="color: white; margin: 5px 0;">✓ Daya Teoritis: <strong>{instant_watt}W</strong></p>
-                    <p style="color: white; margin: 5px 0; font-size: 0.85rem;">&nbsp;&nbsp;&nbsp;(jika semua nyala 100%)</p>
-                    <p style="color: white; margin: 5px 0;">✓ Daya Puncak Realistis: <strong>{realistic_peak_watt:.0f}W</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Kapasitas Aman: <strong>{(va * 0.85):.0f}W</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Utilisasi: <strong>{utilization_realistic:.1f}%</strong> dari {va}VA</p>
-                    <p style="color: white; margin: 5px 0;">✓ Status: <strong>{risk_text}</strong></p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with analysis_col2:
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            padding: 20px; border-radius: 10px; color: white; margin-bottom: 10px;">
-                    <h4 style="color: white; margin-top: 0;">🔧 Detail Teknis</h4>
-                    <p style="color: white; margin: 5px 0;">✓ Metode: <strong>{prediction_method}</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Waktu: <strong>{current_hour}:00</strong> ({'Maghrib peak' if 17 <= current_hour <= 22 else 'Off-peak'})</p>
-                    <p style="color: white; margin: 5px 0;">✓ Tipe Rumah: <strong>{house_type}</strong></p>
-                    <p style="color: white; margin: 5px 0;">✓ Tarif PLN: <strong>Rp {tariff:,}/kWh</strong></p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.markdown("""
-                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            padding: 20px; border-radius: 10px; color: white;">
-                    <h4 style="color: white; margin-top: 0;">💡 Catatan Penting</h4>
-                    <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Peralatan dicentang = yang DIMILIKI</p>
-                    <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Sistem hitung pola pemakaian normal</p>
-                    <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Simultaneity Factor aktif</p>
-                    <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Proyeksi: Harian × 30/365</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Main content
-            col_left, col_right = st.columns([2, 1])
-            
-            with col_left:
-                # Power breakdown
-                if breakdown:
-                    st.markdown("### 🔌 Breakdown Konsumsi")
-                    
-                    # Build dataframe with multi-mode support
-                    breakdown_rows = []
-                    for item in breakdown:
-                        if item[4]:  # Multi-mode
-                            name, max_power, modes, total_kwh, _ = item
-                            # Main row
-                            mode_str = " + ".join([f"{m[0]} {m[2]}h" for m in modes])
-                            breakdown_rows.append({
-                                'Peralatan': f"{name} ({mode_str})",
-                                'Daya (W)': max_power,
-                                'kWh/Hari': total_kwh,
-                                'Biaya/Hari (Rp)': int(total_kwh * tariff),
-                                'Biaya/Bulan (Rp)': int(total_kwh * tariff * 30)
-                            })
-                        else:  # Single-mode
-                            name, power, hours, kwh, _ = item
-                            breakdown_rows.append({
-                                'Peralatan': name,
-                                'Daya (W)': power,
-                                'kWh/Hari': kwh,
-                                'Biaya/Hari (Rp)': int(kwh * tariff),
-                                'Biaya/Bulan (Rp)': int(kwh * tariff * 30)
-                            })
-                    
-                    breakdown_df = pd.DataFrame(breakdown_rows)
-                    st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
-                    
-                    # Pie chart - by daily cost
-                    pie_labels = []
-                    pie_values = []
-                    for item in breakdown:
-                        if item[4]:  # Multi-mode
-                            name, _, _, total_kwh, _ = item
-                            pie_labels.append(name)
-                            pie_values.append(total_kwh * tariff)
-                        else:  # Single-mode
-                            name, _, _, kwh, _ = item
-                            pie_labels.append(name)
-                            pie_values.append(kwh * tariff)
-                    
-                    fig_pie = go.Figure(data=[go.Pie(
-                        labels=pie_labels,
-                        values=pie_values,
-                        hole=0.4,
-                        textinfo='label+percent',
-                        hovertemplate='%{label}<br>Rp %{value:,.0f}/hari<extra></extra>'
-                    )])
-                    fig_pie.update_layout(
-                        title="Distribusi Biaya Harian per Peralatan",
-                        height=350, 
-                        margin=dict(l=20, r=20, t=40, b=20)
-                    )
-                    st.plotly_chart(fig_pie, use_container_width=True)
-            
-            with col_right:
-                st.markdown("### 💡 Rekomendasi Hemat")
-                recommendations = generate_recommendations(
-                    current_kw, va, house_type, current_hour,
-                    selected_appliances, dataset, realistic_peak_kw,
-                    ml_curve=ml_curve,
-                    custom_durations=st.session_state.get('custom_durations', {}),
-                    tariff=tariff,
-                    breakdown=breakdown,
-                    daily_kwh=daily_kwh,
-                    appliance_dict=appliance_dict
-                )
-                
-                for rec in recommendations:
-                    priority_class = f"rec-{rec['priority'].lower()}"
-
-                    # Category badge (jika tersedia dari engine baru)
-                    cat = rec.get('category', '')
-                    category_html = (
-                        f'<span style="font-size:0.73rem;opacity:0.85;">'
-                        f'{cat}</span><br>'
-                    ) if cat else ''
-
-                    # Trigger reason pills (jika tersedia dari engine baru)
-                    trigger_html = ''
-                    triggers = rec.get('triggers')
-                    if triggers:
-                        pills = ' '.join(
-                            f'<span style="background:rgba(0,0,0,0.06);'
-                            f'padding:2px 8px;border-radius:10px;'
-                            f'font-size:0.72rem;color:#666;'
-                            f'margin-right:4px;">\u2713 {t}</span>'
-                            for t in triggers
+                if model is not None and features is not None:
+                    with st.spinner('🔮 Menganalisis pola 24 jam dengan ML model...'):
+                        import time
+                        ml_curve = predict_daily_curve(
+                            model, features, selected_appliances, appliance_dict,
+                            va, house_type, is_indonesia, is_weekend=is_weekend_sim,
+                            custom_durations=st.session_state.get('custom_durations', {})
                         )
-                        trigger_html = f'<div style="margin-top:8px;">{pills}</div>'
-
-                    # Build HTML tanpa indentasi multiline agar Streamlit
-                    # tidak memperlakukannya sebagai code block markdown
-                    card_html = (
-                        f'<div class="rec-card {priority_class}">'
-                        f'{category_html}'
-                        f'<strong style="color:#2c3e50 !important;">'
-                        f'{rec["icon"]} {rec["action"]}</strong>'
-                        f'<p style="margin:8px 0 5px 0;color:#555 !important;'
-                        f'font-size:0.95rem;">{rec["reason"]}</p>'
-                        f'<p style="margin:5px 0 0 0;color:#11998e !important;'
-                        f'font-weight:bold;font-size:1rem;">'
-                        f'\U0001f4b0 {rec["saving"]}</p>'
-                        f'{trigger_html}'
-                        f'</div>'
-                    )
-                    st.markdown(card_html, unsafe_allow_html=True)
+                    
+                        if ml_curve and any(v > 0 for v in ml_curve):
+                            # Ambil prediksi spesifik untuk jam SAAT INI langsung dari kurva
+                            ml_prediction = ml_curve[current_hour]
+                            prediction_method = f"Machine Learning Model ({selected_model})"
+                        
+                        # Add delay to show processing
+                        time.sleep(0.8)
             
-            # Penjelasan tambahan berdasarkan risk level
-            if risk_level == "BAHAYA":
-                st.error(f"""
-                🚨 **OVERLOAD - MCB AKAN TRIP KAPAN SAJA!**
-
-                **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
-
-                ⚠️ **TINDAKAN SEGERA DIPERLUKAN:**
-                - MATIKAN AC atau heater sekarang
-                - MATIKAN setrika atau rice cooker
-                - Gunakan peralatan daya besar secara bergantian
-                - Pertimbangkan upgrade daya listrik ke {va*2}VA
-
-                💡 **Kenapa berbahaya?**
-                Beban di atas 100% akan membuat MCB trip (listrik padam otomatis).
-                """)
-            elif risk_level == "KRITIS":
-                st.warning(f"""
-                🔴 **KRITIS - HAMPIR PENUH!**
-
-                **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
-
-                ⚠️ Hindari menyalakan peralatan besar tambahan — lonjakan kecil bisa MCB trip.
-                💡 Sisa margin: {max(0, 100-utilization_realistic):.1f}% — sangat sedikit!
-                """)
-            elif risk_level == "BERAT":
-                st.info(f"""
-                ⚡ **BEBAN BERAT - PERLU PERHATIAN**
-
-                **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
-
-                ✓ Masih aman — jangan tambah peralatan daya besar (>500W) bersamaan.
-                📈 Pertimbangkan upgrade ke {va*1.5:.0f}VA untuk kenyamanan lebih.
-                """) 
-            elif risk_level == "PERHATIAN":
-                # Khusus 900/1300 VA dengan interlocking aktif — tampilkan status yang lebih informatif
-                if va <= 1300:
-                    st.info(f"""
-                    🔄 **MANAJEMEN BEBAN AKTIF**
-
-                    **Utilisasi realistis: {utilization_realistic:.1f}%** (setelah Interlocking Factor diterapkan)
-
-                    Sistem mendeteksi bahwa jika seluruh peralatan Anda nyala bersamaan, beban melebihi
-                    kapasitas {va}VA. Namun dalam praktik, pengguna daya rendah secara alami
-                    **menggunakan peralatan secara bergantian** — itulah Interlocking Factor.
-
-                    ✓ Selama Anda tidak nyalakan AC + Rice Cooker + Setrika bersamaan, kondisi aman.
-                    💡 Tips: Matikan AC dulu sebelum menyalakan setrika atau pompa air.
-                    """)
+                # Use ML prediction if available, else use calculated heuristic
+                predicted_instant_kw = ml_prediction if ml_prediction is not None else current_kw_heur
+            
+                # Analysis Logic Section
+                st.markdown("### 🔍 Analisis Sistem")
+            
+                # Show prediction comparison
+                if ml_prediction is not None:
+                    col_pred1, col_pred2 = st.columns(2)
+                    with col_pred1:
+                        st.metric(
+                            "🤖 Prediksi ML Model (Jam Ini)", 
+                            f"{predicted_instant_kw:.3f} kW",
+                            help="Prediksi konsumsi daya realistis dari model ML pada jam berjalan"
+                        )
+                    with col_pred2:
+                        st.metric(
+                            "🧮 Manual Dinamis (Jam Ini)", 
+                            f"{current_kw_heur:.3f} kW",
+                            help="Estimasi manual konsumsi daya berdasarkan jadwal aktif peralatan pada jam berjalan"
+                        )
+                
+                    # Show difference
+                    diff_percent = abs(predicted_instant_kw - current_kw_heur) / max(current_kw_heur, 0.001) * 100
+                    if diff_percent < 15:
+                        st.success(f"✅ Model ML dan estimasi manual jam ini sangat sesuai (selisih {diff_percent:.1f}%)")
+                    else:
+                        st.info(f"ℹ️ Selisih {diff_percent:.1f}% — Model ML menyesuaikan dengan faktor temporal eksternal & lag konsumsi")
+                
+                    st.caption("⚠️ Catatan: Perbandingan di atas bersifat Apple-to-Apple pada jam berjalan, bukan membandingkan total seluruh daya peralatan rumah.")
+            
+                # ==================================================================
+                # 📈 DAILY LOAD CURVE - The KEY ML Feature
+                # ==================================================================
+                st.markdown("### 📈 Prediksi Konsumsi 24 Jam (ML)")
+                st.caption("Grafik ini menunjukkan bagaimana model ML memprediksi pola konsumsi Anda sepanjang hari")
+            
+                if ml_curve and any(v > 0 for v in ml_curve):
+                    # Static line (flat calculation for comparison)
+                    static_line = [current_kw] * 24
+                
+                    hours = list(range(24))
+                    hour_labels = [f"{h:02d}:00" for h in hours]
+                
+                    # Create the chart
+                    fig_curve = go.Figure()
+                
+                    # ML Prediction curve
+                    fig_curve.add_trace(go.Scatter(
+                        x=hour_labels,
+                        y=ml_curve,
+                        mode='lines+markers',
+                        name='Prediksi ML',
+                        line=dict(color='#667eea', width=3),
+                        marker=dict(size=6),
+                        fill='tozeroy',
+                        fillcolor='rgba(102, 126, 234, 0.2)'
+                    ))
+                
+                    # Static calculation line
+                    fig_curve.add_trace(go.Scatter(
+                        x=hour_labels,
+                        y=static_line,
+                        mode='lines',
+                        name='Kalkulator Statis',
+                        line=dict(color='#888', width=2, dash='dash')
+                    ))
+                
+                    # Capacity limit line
+                    max_capacity = (va * 0.85) / 1000
+                    fig_curve.add_trace(go.Scatter(
+                        x=hour_labels,
+                        y=[max_capacity] * 24,
+                        mode='lines',
+                        name=f'Batas Aman ({va}VA)',
+                        line=dict(color='#eb3349', width=2, dash='dot')
+                    ))
+                
+                    # Highlight peak hours (17:00-22:00)
+                    fig_curve.add_vrect(
+                        x0="17:00", x1="22:00",
+                        fillcolor="rgba(235, 51, 73, 0.1)",
+                        layer="below",
+                        line_width=0,
+                        annotation_text="Peak Hours",
+                        annotation_position="top left"
+                    )
+                
+                    fig_curve.update_layout(
+                        title=f"Pola Konsumsi Harian - {'Weekend' if is_weekend_sim else 'Weekday'}",
+                        xaxis_title="Jam",
+                        yaxis_title="Konsumsi (kW)",
+                        height=400,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        hovermode='x unified'
+                    )
+                
+                    st.plotly_chart(fig_curve, use_container_width=True)
+                
+                    # Key insight box
+                    peak_hour = ml_curve.index(max(ml_curve))
+                    min_hour = ml_curve.index(min(ml_curve))
+                    peak_value = max(ml_curve)
+                
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); 
+                                padding: 15px; border-radius: 10px; color: white;">
+                        <strong style="color: white;">🎯 Insight dari Model ML:</strong><br>
+                        • Jam puncak diprediksi: <strong>{peak_hour:02d}:00</strong> ({peak_value:.2f} kW)<br>
+                        • Jam paling efisien: <strong>{min_hour:02d}:00</strong><br>
+                        • Ini berbeda dari kalkulator biasa yang menganggap beban konstan sepanjang hari.
+                    </div>
+                    """, unsafe_allow_html=True)
                 else:
-                    st.info(f"""
-                    🟡 **BEBAN SEDANG**
+                    st.info("📊 Model ML tidak tersedia atau mengembalikan prediksi kosong. Menggunakan estimasi daya statis.")
+            
+                st.markdown("<br>", unsafe_allow_html=True)
+            
+                # Analysis box dengan native Streamlit (bukan HTML)
+                st.markdown("### 📝 Evaluasi Rumah Tangga")
+            
+                # Create columns for better layout
+                analysis_col1, analysis_col2 = st.columns([1, 1])
+            
+                with analysis_col1:
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                padding: 20px; border-radius: 10px; color: white; margin-bottom: 10px;">
+                        <h4 style="color: white; margin-top: 0;">📊 Peralatan & Konsumsi</h4>
+                        <p style="color: white; margin: 5px 0;">✓ Peralatan Dimiliki: <strong>{len(selected_appliances)} item</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Konsumsi Harian: <strong>{daily_kwh:.2f} kWh/hari</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Biaya Harian: <strong>Rp {daily_cost:,.0f}</strong></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                padding: 20px; border-radius: 10px; color: white;">
+                        <h4 style="color: white; margin-top: 0;">⚡ Beban Listrik</h4>
+                        <p style="color: white; margin: 5px 0;">✓ Daya Teoritis: <strong>{instant_watt}W</strong></p>
+                        <p style="color: white; margin: 5px 0; font-size: 0.85rem;">&nbsp;&nbsp;&nbsp;(jika semua nyala 100%)</p>
+                        <p style="color: white; margin: 5px 0;">✓ Daya Puncak Realistis: <strong>{realistic_peak_watt:.0f}W</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Kapasitas Aman: <strong>{(va * 0.85):.0f}W</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Utilisasi: <strong>{utilization_realistic:.1f}%</strong> dari {va}VA</p>
+                        <p style="color: white; margin: 5px 0;">✓ Status: <strong>{risk_text}</strong></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+                with analysis_col2:
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                padding: 20px; border-radius: 10px; color: white; margin-bottom: 10px;">
+                        <h4 style="color: white; margin-top: 0;">🔧 Detail Teknis</h4>
+                        <p style="color: white; margin: 5px 0;">✓ Metode: <strong>{prediction_method}</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Waktu: <strong>{current_hour}:00</strong> ({'Maghrib peak' if 17 <= current_hour <= 22 else 'Off-peak'})</p>
+                        <p style="color: white; margin: 5px 0;">✓ Tipe Rumah: <strong>{house_type}</strong></p>
+                        <p style="color: white; margin: 5px 0;">✓ Tarif PLN: <strong>Rp {tariff:,}/kWh</strong></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                    st.markdown("""
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                padding: 20px; border-radius: 10px; color: white;">
+                        <h4 style="color: white; margin-top: 0;">💡 Catatan Penting</h4>
+                        <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Peralatan dicentang = yang DIMILIKI</p>
+                        <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Sistem hitung pola pemakaian normal</p>
+                        <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Simultaneity Factor aktif</p>
+                        <p style="color: white; margin: 5px 0; font-size: 0.9rem;">• Proyeksi: Harian × 30/365</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+                # Main content
+                col_left, col_right = st.columns([2, 1])
+            
+                with col_left:
+                    # Power breakdown
+                    if breakdown:
+                        st.markdown("### 🔌 Breakdown Konsumsi")
+                    
+                        # Build dataframe with multi-mode support
+                        breakdown_rows = []
+                        for item in breakdown:
+                            if item[4]:  # Multi-mode
+                                name, max_power, modes, total_kwh, _ = item
+                                # Main row
+                                mode_str = " + ".join([f"{m[0]} {m[2]}h" for m in modes])
+                                breakdown_rows.append({
+                                    'Peralatan': f"{name} ({mode_str})",
+                                    'Daya (W)': max_power,
+                                    'kWh/Hari': total_kwh,
+                                    'Biaya/Hari (Rp)': int(total_kwh * tariff),
+                                    'Biaya/Bulan (Rp)': int(total_kwh * tariff * 30)
+                                })
+                            else:  # Single-mode
+                                name, power, hours, kwh, _ = item
+                                breakdown_rows.append({
+                                    'Peralatan': name,
+                                    'Daya (W)': power,
+                                    'kWh/Hari': kwh,
+                                    'Biaya/Hari (Rp)': int(kwh * tariff),
+                                    'Biaya/Bulan (Rp)': int(kwh * tariff * 30)
+                                })
+                    
+                        breakdown_df = pd.DataFrame(breakdown_rows)
+                        st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+                    
+                        # Pie chart - by daily cost
+                        pie_labels = []
+                        pie_values = []
+                        for item in breakdown:
+                            if item[4]:  # Multi-mode
+                                name, _, _, total_kwh, _ = item
+                                pie_labels.append(name)
+                                pie_values.append(total_kwh * tariff)
+                            else:  # Single-mode
+                                name, _, _, kwh, _ = item
+                                pie_labels.append(name)
+                                pie_values.append(kwh * tariff)
+                    
+                        fig_pie = go.Figure(data=[go.Pie(
+                            labels=pie_labels,
+                            values=pie_values,
+                            hole=0.4,
+                            textinfo='label+percent',
+                            hovertemplate='%{label}<br>Rp %{value:,.0f}/hari<extra></extra>'
+                        )])
+                        fig_pie.update_layout(
+                            title="Distribusi Biaya Harian per Peralatan",
+                            height=350, 
+                            margin=dict(l=20, r=20, t=40, b=20)
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+            
+                with col_right:
+                    st.markdown("### 💡 Rekomendasi Hemat")
+                    recommendations = generate_recommendations(
+                        current_kw, va, house_type, current_hour,
+                        selected_appliances, realistic_peak_kw,
+                        ml_curve=ml_curve,
+                        custom_durations=st.session_state.get('custom_durations', {}),
+                        tariff=tariff,
+                        breakdown=breakdown,
+                        daily_kwh=daily_kwh,
+                        appliance_dict=appliance_dict,
+                        dayofweek=5 if is_weekend_sim else 1
+                    )
+                
+                    for rec in recommendations:
+                        priority_class = f"rec-{rec['priority'].lower()}"
+
+                        # Category badge (jika tersedia dari engine baru)
+                        cat = rec.get('category', '')
+                        category_html = (
+                            f'<span style="font-size:0.73rem;opacity:0.85;">'
+                            f'{cat}</span><br>'
+                        ) if cat else ''
+
+                        # Trigger reason pills (jika tersedia dari engine baru)
+                        trigger_html = ''
+                        triggers = rec.get('triggers')
+                        if triggers:
+                            pills = ' '.join(
+                                f'<span style="background:rgba(0,0,0,0.06);'
+                                f'padding:2px 8px;border-radius:10px;'
+                                f'font-size:0.72rem;color:#666;'
+                                f'margin-right:4px;">\u2713 {t}</span>'
+                                for t in triggers
+                            )
+                            trigger_html = f'<div style="margin-top:8px;">{pills}</div>'
+
+                        # Build HTML tanpa indentasi multiline agar Streamlit
+                        # tidak memperlakukannya sebagai code block markdown
+                        card_html = (
+                            f'<div class="rec-card {priority_class}">'
+                            f'{category_html}'
+                            f'<strong style="color:#2c3e50 !important;">'
+                            f'{rec["icon"]} {rec["action"]}</strong>'
+                            f'<p style="margin:8px 0 5px 0;color:#555 !important;'
+                            f'font-size:0.95rem;">{rec["reason"]}</p>'
+                            f'<p style="margin:5px 0 0 0;color:#11998e !important;'
+                            f'font-weight:bold;font-size:1rem;">'
+                            f'\U0001f4b0 {rec["saving"]}</p>'
+                            f'{trigger_html}'
+                            f'</div>'
+                        )
+                        st.markdown(card_html, unsafe_allow_html=True)
+            
+                # Penjelasan tambahan berdasarkan risk level
+                if risk_level == "BAHAYA":
+                    st.error(f"""
+                    🚨 **OVERLOAD - MCB AKAN TRIP KAPAN SAJA!**
 
                     **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
 
-                    ✓ Kondisi normal. Sisa margin: {max(0, 100-utilization_realistic):.1f}%
-                    💡 Tips: Gunakan AC dan rice cooker/setrika secara bergantian.
+                    ⚠️ **TINDAKAN SEGERA DIPERLUKAN:**
+                    - MATIKAN AC atau heater sekarang
+                    - MATIKAN setrika atau rice cooker
+                    - Gunakan peralatan daya besar secara bergantian
+                    - Pertimbangkan upgrade daya listrik ke {va*2}VA
+
+                    💡 **Kenapa berbahaya?**
+                    Beban di atas 100% akan membuat MCB trip (listrik padam otomatis).
                     """)
-            else:
-                st.success(f"""
-                ✅ **AMAN - BEBAN NORMAL**
+                elif risk_level == "KRITIS":
+                    st.warning(f"""
+                    🔴 **KRITIS - HAMPIR PENUH!**
 
-                **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
+                    **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
 
-                💚 Beban listrik normal dan aman.
-                ✓ Sisa margin: {max(0, 100-utilization_realistic):.1f}% untuk peralatan tambahan.
-                """)
+                    ⚠️ Hindari menyalakan peralatan besar tambahan — lonjakan kecil bisa MCB trip.
+                    💡 Sisa margin: {max(0, 100-utilization_realistic):.1f}% — sangat sedikit!
+                    """)
+                elif risk_level == "BERAT":
+                    st.info(f"""
+                    ⚡ **BEBAN BERAT - PERLU PERHATIAN**
+
+                    **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
+
+                    ✓ Masih aman — jangan tambah peralatan daya besar (≥500W) bersamaan.
+                    📈 Pertimbangkan upgrade ke {va*1.5:.0f}VA untuk kenyamanan lebih.
+                    """) 
+                elif risk_level == "PERHATIAN":
+                    # Khusus 900/1300 VA dengan interlocking aktif — tampilkan status yang lebih informatif
+                    if va <= 1300:
+                        st.info(f"""
+                        🔄 **MANAJEMEN BEBAN AKTIF**
+
+                        **Utilisasi realistis: {utilization_realistic:.1f}%** (setelah Interlocking Factor diterapkan)
+
+                        Sistem mendeteksi bahwa jika seluruh peralatan Anda nyala bersamaan, beban melebihi
+                        kapasitas {va}VA. Namun dalam praktik, pengguna daya rendah secara alami
+                        **menggunakan peralatan secara bergantian** — itulah Interlocking Factor.
+
+                        ✓ Selama Anda tidak nyalakan AC + Rice Cooker + Setrika bersamaan, kondisi aman.
+                        💡 Tips: Matikan AC dulu sebelum menyalakan setrika atau pompa air.
+                        """)
+                    else:
+                        st.info(f"""
+                        🟡 **BEBAN SEDANG**
+
+                        **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
+
+                        ✓ Kondisi normal. Sisa margin: {max(0, 100-utilization_realistic):.1f}%
+                        💡 Tips: Gunakan AC dan rice cooker/setrika secara bergantian.
+                        """)
+                else:
+                    st.success(f"""
+                    ✅ **AMAN - BEBAN NORMAL**
+
+                    **Beban Anda: {utilization_realistic:.1f}% dari kapasitas {va}VA**
+
+                    💚 Beban listrik normal dan aman.
+                    ✓ Sisa margin: {max(0, 100-utilization_realistic):.1f}% untuk peralatan tambahan.
+                    """)
             
-            # Info tambahan tentang simultaneity
-            with st.expander("📊 Detail Perhitungan Beban"):
-                st.markdown(f"""
-                ### Bagaimana Sistem Menghitung Beban?
+                # Info tambahan tentang simultaneity
+                with st.expander("📊 Detail Perhitungan Beban"):
+                    st.markdown(f"""
+                    ### Bagaimana Sistem Menghitung Beban?
                 
-                **1. Daya Teoritis (jika semua 100% bersamaan):**
-                - Total: {instant_watt}W
-                - Utilisasi: {utilization_worst:.1f}%
+                    **1. Daya Teoritis (jika semua 100% bersamaan):**
+                    - Total: {instant_watt}W
+                    - Utilisasi: {utilization_worst:.1f}%
                 
-                **2. Daya Puncak Realistis (dengan Simultaneity Factor):**
-                - Total: {realistic_peak_watt:.0f}W  
-                - Utilisasi: {utilization_realistic:.1f}% ← **Yang digunakan untuk status**
+                    **2. Daya Puncak Realistis (dengan Simultaneity Factor):**
+                    - Total: {realistic_peak_watt:.0f}W  
+                    - Utilisasi: {utilization_realistic:.1f}% ← **Yang digunakan untuk status**
                 
-                **3. Kenapa ada perbedaan?**
+                    **3. Kenapa ada perbedaan?**
                 
-                Sistem menggunakan **Simultaneity Factor** berdasarkan standar IEC 60364:
-                - **Peralatan daya tinggi (>500W):** Hanya 1 nyala penuh, lainnya cycling (30%)
-                  - Contoh: AC tidak full 900W terus (compressor cycling on-off)
-                - **Peralatan daya sedang (200-500W):** 70% bersamaan
-                  - Contoh: Rice cooker dan pompa jarang nyala 100% bersamaan
-                - **Peralatan daya rendah (<200W):** 90% bersamaan
-                  - Contoh: Lampu, kipas kecil hampir selalu nyala
+                    Sistem menggunakan **faktor kebersamaan berbasis heuristik** yang diadaptasi
+                    dari prinsip *Simultaneity Factor* dan *Diversity Factor* pada instalasi
+                    listrik tegangan rendah (bukan nilai baku yang dikutip langsung dari tabel IEC):
+                    - **Peralatan daya tinggi (≥500W):** Hanya 1 nyala penuh, lainnya cycling (30%)
+                      - Contoh: AC tidak full 900W terus (compressor cycling on-off)
+                    - **Peralatan daya sedang (≥200W dan <500W):** 70% bersamaan
+                      - Contoh: Rice cooker dan pompa jarang nyala 100% bersamaan
+                    - **Peralatan daya rendah (<200W):** 90% bersamaan
+                      - Contoh: Lampu, kipas kecil hampir selalu nyala
                 
-                **Analogi:**
-                Seperti jalan tol dengan kapasitas 1000 mobil. Meski ada 1500 mobil terdaftar (dimiliki),
-                tidak semua masuk bersamaan. Yang masuk sekaligus ~800 mobil (realistis).
+                    **Analogi:**
+                    Seperti jalan tol dengan kapasitas 1000 mobil. Meski ada 1500 mobil terdaftar (dimiliki),
+                    tidak semua masuk bersamaan. Yang masuk sekaligus ~800 mobil (realistis).
                 
-                💡 **Catatan:** Peralatan yang Anda centang = peralatan yang DIMILIKI, 
-                bukan yang sedang nyala sekarang. Sistem menghitung pola pemakaian normal harian.
-                """)
+                    💡 **Catatan:** Peralatan yang Anda centang = peralatan yang DIMILIKI, 
+                    bukan yang sedang nyala sekarang. Sistem menghitung pola pemakaian normal harian.
+                    """)
 
 
             
-            # Export PDF button
-            st.markdown("---")
-            col_export1, col_export2, col_export3 = st.columns([1, 1, 1])
-            with col_export2:
-                try:
-                    # Generate PDF
-                    pdf_buffer = generate_pdf_report(
-                        va=va,
-                        house_type=house_type,
-                        selected_appliances=selected_appliances,
-                        appliance_dict=appliance_dict,
-                        instant_watt=instant_watt,
-                        daily_kwh=daily_kwh,
-                        current_kw=current_kw,
-                        predicted_instant_kw=predicted_instant_kw,
-                        utilization_realistic=utilization_realistic,
-                        utilization_worst=utilization_worst,
-                        risk_level=risk_level,
-                        risk_text=risk_text,
-                        daily_cost=daily_cost,
-                        monthly_cost=monthly_cost,
-                        tariff=tariff,
-                        breakdown=breakdown,
-                        recommendations=recommendations,
-                        is_indonesia=is_indonesia,
-                        selected_model=selected_model,
-                        prediction_method=prediction_method,
-                        ml_prediction=ml_prediction,
-                        realistic_peak_watt=realistic_peak_watt,
-                        va_option_string=va_option,
-                        is_weekend_sim=is_weekend_sim
-                    )
+                # Export PDF button
+                st.markdown("---")
+                col_export1, col_export2, col_export3 = st.columns([1, 1, 1])
+                with col_export2:
+                    try:
+                        # Generate PDF
+                        pdf_buffer = generate_pdf_report(
+                            va=va,
+                            house_type=house_type,
+                            selected_appliances=selected_appliances,
+                            appliance_dict=appliance_dict,
+                            instant_watt=instant_watt,
+                            daily_kwh=daily_kwh,
+                            current_kw=current_kw,
+                            predicted_instant_kw=predicted_instant_kw,
+                            utilization_realistic=utilization_realistic,
+                            utilization_worst=utilization_worst,
+                            risk_level=risk_level,
+                            risk_text=risk_text,
+                            daily_cost=daily_cost,
+                            monthly_cost=monthly_cost,
+                            tariff=tariff,
+                            breakdown=breakdown,
+                            recommendations=recommendations,
+                            is_indonesia=is_indonesia,
+                            selected_model=selected_model,
+                            prediction_method=prediction_method,
+                            ml_prediction=ml_prediction,
+                            realistic_peak_watt=realistic_peak_watt,
+                            va_option_string=va_option,
+                            is_weekend_sim=is_weekend_sim
+                        )
                     
-                    # Download button
-                    filename = f"HEMAT_Laporan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-                    st.download_button(
-                        label="📄 Export Laporan PDF",
-                        data=pdf_buffer,
-                        file_name=filename,
-                        mime="application/pdf",
-                        use_container_width=True,
-                        type="primary"
-                    )
-                except ImportError:
-                    st.error("⚠️ Library ReportLab belum terinstall. Jalankan: pip install reportlab")
-                except Exception as e:
-                    st.error(f"⚠️ Error membuat PDF: {str(e)}")
-                    st.info("Pastikan library reportlab sudah terinstall dengan benar.")
+                        # Download button
+                        filename = f"HEMAT_Laporan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        st.download_button(
+                            label="📄 Export Laporan PDF",
+                            data=pdf_buffer,
+                            file_name=filename,
+                            mime="application/pdf",
+                            use_container_width=True,
+                            type="primary"
+                        )
+                    except ImportError:
+                        st.error("⚠️ Library ReportLab belum terinstall. Jalankan: pip install reportlab")
+                    except Exception as e:
+                        st.error(f"⚠️ Error membuat PDF: {str(e)}")
+                        st.info("Pastikan library reportlab sudah terinstall dengan benar.")
     
     # ========================================================================
     # TAB 2: MODEL ANALYSIS
